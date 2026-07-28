@@ -589,3 +589,4 @@ async def test_save_to_mailbox_tool_custom_folder(monkeypatch):
     command = command_handler.await_args.args[0]
     assert command.mailbox == "INBOX.Drafts"
     assert command.flags == (r"\Draft", r"\Seen")
+    assert command.quote_history is True

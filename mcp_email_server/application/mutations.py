@@ -223,6 +223,7 @@ class ComposeCommand:
     attachments: tuple[str, ...] = ()
     in_reply_to: str | None = None
     references: str | None = None
+    quote_history: bool = True
 
     def validate(self) -> None:
         _validate_account_name(self.account_name)

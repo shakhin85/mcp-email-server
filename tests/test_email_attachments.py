@@ -778,3 +778,63 @@ class TestDownloadAttachmentSenderAllowlist:
             )
         assert result["attachment_name"] == "ausflug.png"
         mock_senders.assert_not_called()
+
+
+class TestInlineImages:
+    """cid:-referenced images in HTML bodies become inline multipart/related parts."""
+
+    @pytest.fixture
+    def email_client(self):
+        server = EmailServer(
+            user_name="test@example.com",
+            password="password",
+            host="smtp.example.com",
+            port=587,
+            use_ssl=False,
+        )
+        return EmailClient(server, sender="test@example.com")
+
+    def _png(self, tmp_path, name="pic.png"):
+        p = tmp_path / name
+        p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+        return p
+
+    def test_cid_image_becomes_inline_related(self, email_client, tmp_path):
+        png = self._png(tmp_path)
+        msg = email_client._create_message_with_attachments(
+            '<p>hi</p><img src="cid:pic.png">', html=True, attachments=[str(png)]
+        )
+        assert msg.get_content_type() == "multipart/related"
+        image_parts = [p for p in msg.walk() if p.get_content_maintype() == "image"]
+        assert len(image_parts) == 1
+        assert image_parts[0]["Content-ID"] == "<pic.png>"
+        assert "inline" in image_parts[0]["Content-Disposition"]
+
+    def test_cid_image_plus_regular_attachment(self, email_client, tmp_path):
+        png = self._png(tmp_path)
+        doc = tmp_path / "report.xlsx"
+        doc.write_bytes(b"fake xlsx")
+        msg = email_client._create_message_with_attachments(
+            '<img src="cid:pic.png">', html=True, attachments=[str(png), str(doc)]
+        )
+        assert msg.get_content_type() == "multipart/mixed"
+        related = [p for p in msg.get_payload() if p.get_content_type() == "multipart/related"]
+        assert len(related) == 1
+        dispositions = [str(p.get("Content-Disposition", "")) for p in msg.walk()]
+        assert any("attachment" in d and "report.xlsx" in d for d in dispositions)
+
+    def test_unreferenced_image_stays_regular_attachment(self, email_client, tmp_path):
+        png = self._png(tmp_path)
+        msg = email_client._create_message_with_attachments("<p>no cid here</p>", html=True, attachments=[str(png)])
+        assert msg.get_content_type() == "multipart/mixed"
+        dispositions = [str(p.get("Content-Disposition", "")) for p in msg.walk()]
+        assert any(d.startswith("attachment") for d in dispositions)
+        assert not any(d.startswith("inline") for d in dispositions)
+
+    def test_plain_text_body_ignores_cid(self, email_client, tmp_path):
+        png = self._png(tmp_path)
+        msg = email_client._create_message_with_attachments(
+            "text cid:pic.png mention", html=False, attachments=[str(png)]
+        )
+        dispositions = [str(p.get("Content-Disposition", "")) for p in msg.walk()]
+        assert not any(d.startswith("inline") for d in dispositions)

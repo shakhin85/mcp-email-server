@@ -1,12 +1,16 @@
 import asyncio
 import base64
 import binascii
+import email.message
 import email.utils
 import mimetypes
+import os
 import re
 import ssl
+import struct
 import time
 import unicodedata
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -16,12 +20,14 @@ from email.header import Header
 from email.headerregistry import Address, AddressHeader
 from email.message import EmailMessage, Message
 from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
 from email.policy import SMTP as SMTP_POLICY
 from email.policy import SMTPUTF8 as SMTPUTF8_POLICY
 from email.policy import default
+from html import escape as escape_html
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
@@ -1018,6 +1024,101 @@ def _smtp_error_category(error: Exception) -> str:
     if isinstance(error, OSError):
         return "io"
     return "unexpected"
+
+
+_THREAD_TOPIC_PREFIX = re.compile(r"^(?:re|fw|fwd|отв|пересл)\s*:\s*", re.IGNORECASE)
+
+
+def _normalize_thread_topic(subject: str) -> str:
+    """Subject without Re:/Fwd: prefixes — Outlook's ConversationTopic."""
+    topic = subject.strip()
+    while match := _THREAD_TOPIC_PREFIX.match(topic):
+        topic = topic[match.end() :]
+    return topic
+
+
+def _new_thread_index() -> str:
+    """22-byte Outlook ConversationIndex (MS-OXOMSG): FILETIME[0:6] + GUID."""
+    filetime = int((time.time() + 11_644_473_600) * 10_000_000)
+    return base64.b64encode(filetime.to_bytes(8, "big")[:6] + uuid.uuid4().bytes).decode()
+
+
+def _child_thread_index(parent_b64: str) -> str | None:
+    """Parent's index + 5-byte child block — same conversation, one level deeper."""
+    try:
+        parent = base64.b64decode(parent_b64.strip())
+    except (ValueError, binascii.Error):
+        return None
+    if len(parent) < 22:
+        return None
+    child_block = struct.pack(">I", int(time.time()) & 0xFFFFFFFF) + os.urandom(1)
+    return base64.b64encode(parent + child_block).decode()
+
+
+_QUOTE_DIVIDER = "_" * 32
+
+
+def _parent_bodies(message: email.message.Message) -> tuple[str, str]:
+    """Return (text, html) bodies of a parsed message, first part of each kind."""
+
+    def decode(part: email.message.Message) -> str:
+        payload = part.get_payload(decode=True)
+        if not payload:
+            return ""
+        charset = part.get_content_charset("utf-8")
+        try:
+            return payload.decode(charset)
+        except (UnicodeDecodeError, LookupError):
+            return payload.decode("utf-8", errors="replace")
+
+    text, html_body = "", ""
+    parts = message.walk() if message.is_multipart() else [message]
+    for part in parts:
+        if part.get_content_maintype() == "multipart" or part.get_filename():
+            continue
+        content_type = part.get_content_type()
+        if content_type == "text/plain" and not text:
+            text = decode(part)
+        elif content_type == "text/html" and not html_body:
+            html_body = decode(part)
+    return text, html_body
+
+
+def _quote_header_fields(parent: dict[str, str]) -> list[tuple[str, str]]:
+    fields = [
+        ("From", parent.get("from", "")),
+        ("Sent", parent.get("date", "")),
+        ("To", parent.get("to", "")),
+        ("Cc", parent.get("cc", "")),
+        ("Subject", parent.get("subject", "")),
+    ]
+    return [(label, value) for label, value in fields if value]
+
+
+def _quote_history_plain(body: str, parent: dict[str, str]) -> str:
+    """Append the quoted parent below *body*, Outlook plain-text style."""
+    header = "\n".join(f"{label}: {value}" for label, value in _quote_header_fields(parent))
+    parent_body = parent.get("body_text") or _html_to_text(parent.get("body_html", ""))
+    return f"{body}\n\n{_QUOTE_DIVIDER}\n{header}\n\n{parent_body}".rstrip() + "\n"
+
+
+def _quote_history_html(body: str, parent: dict[str, str]) -> str:
+    """Append the quoted parent below *body*, Outlook HTML style."""
+    header = "<br>".join(f"<b>{label}:</b> {escape_html(value)}" for label, value in _quote_header_fields(parent))
+    parent_html = parent.get("body_html", "")
+    if parent_html:
+        # Unwrap a full HTML document so it nests validly inside our body.
+        soup = BeautifulSoup(parent_html, "html.parser")
+        if soup.body is not None:
+            parent_html = soup.body.decode_contents()
+    else:
+        parent_html = escape_html(parent.get("body_text", "")).replace("\n", "<br>\n")
+    return (
+        f"{body}<br><br>"
+        f'<div style="border:none;border-top:solid #E1E1E1 1.0pt;padding:3.0pt 0 0 0">'
+        f'<p style="margin:0 0 1em 0">{header}</p></div>'
+        f"{parent_html}"
+    )
 
 
 class EmailClient:
@@ -2115,13 +2216,31 @@ class EmailClient:
         logger.info(f"Attached file: {path.name} ({mime_type})")
         return attachment_part
 
+    def _create_inline_image_part(self, path: Path, file_data: bytes) -> MIMEImage:
+        """Create an inline image part referenced from the HTML body as cid:<basename>."""
+        mime_type, _ = mimetypes.guess_type(str(path))
+        part = MIMEImage(file_data, _subtype=(mime_type or "image/png").split("/")[1])
+        part.add_header("Content-ID", f"<{path.name}>")
+        part.add_header("Content-Disposition", "inline", filename=path.name)
+        logger.info(f"Inlined image: {path.name} (cid:{path.name})")
+        return part
+
     def _create_message_with_attachments(self, body: str, html: bool, attachments: list[str]) -> MIMEMultipart:
-        """Create multipart message with attachments."""
-        msg = MIMEMultipart()
+        """Create multipart message with attachments.
+
+        In HTML bodies, ``cid:<filename>`` references (e.g. ``<img
+        src="cid:chart.png">``) are matched against attachment basenames:
+        matching image files become inline parts of a ``multipart/related``
+        container so clients render them in the body; everything else stays
+        a regular attachment.
+        """
         content_type = "html" if html else "plain"
         text_part = MIMEText(body, content_type, "utf-8")
-        msg.attach(text_part)
 
+        inline_cids = set(re.findall(r"""cid:([^"'\s>)]+)""", body)) if html else set()
+
+        inline_parts = []
+        regular_parts = []
         total_attachment_bytes = 0
         for file_path in attachments:
             try:
@@ -2129,13 +2248,76 @@ class EmailClient:
                 file_data = self._read_attachment(path)
                 total_attachment_bytes += len(file_data)
                 self._validate_total_attachment_bytes(total_attachment_bytes)
-                attachment_part = self._create_attachment_part(path, file_data)
-                msg.attach(attachment_part)
+                mime_type, _ = mimetypes.guess_type(str(path))
+                if path.name in inline_cids and (mime_type or "").startswith("image/"):
+                    inline_parts.append(self._create_inline_image_part(path, file_data))
+                else:
+                    regular_parts.append(self._create_attachment_part(path, file_data))
             except Exception as e:
                 logger.error(f"Failed to attach file {file_path}: {e}")
                 raise
 
+        if inline_parts:
+            body_container: MIMEMultipart = MIMEMultipart("related")
+            body_container.attach(text_part)
+            for part in inline_parts:
+                body_container.attach(part)
+            if not regular_parts:
+                return body_container
+        else:
+            body_container = text_part  # type: ignore[assignment]
+
+        msg = MIMEMultipart()
+        msg.attach(body_container)
+        for part in regular_parts:
+            msg.attach(part)
         return msg
+
+    async def _lookup_parent(
+        self, message_id: str, mailboxes: tuple[str, ...] = ("INBOX", "Sent Items", "Sent")
+    ) -> dict[str, str] | None:
+        """Fetch the parent message by Message-ID: its Thread-Index (so a reply
+        joins the same Outlook conversation) plus the headers and bodies needed
+        to quote the history. Best-effort: any failure → None (the reply starts
+        a new conversation and carries no quote)."""
+        try:
+            imap = await self._connect_imap()
+            try:
+                await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+                for mailbox in mailboxes:
+                    select_response = await imap.select(_quote_mailbox(mailbox))
+                    if _imap_status(select_response) != "OK":
+                        continue
+                    # charset=None: Exchange rejects the default "CHARSET US-ASCII"
+                    # with BADCHARSET; Message-ID is pure ASCII anyway.
+                    _, messages = await imap.uid_search(
+                        "HEADER", "Message-ID", f'"{message_id}"', charset=None
+                    )
+                    uids = messages[0].split() if messages and messages[0] else []
+                    if not uids:
+                        continue
+                    data = await self._fetch_email_with_formats(imap, uids[-1].decode())
+                    raw_email = self._extract_raw_email(data) if data else None
+                    if not raw_email:
+                        continue
+                    parsed = BytesParser(policy=default).parsebytes(raw_email)
+                    body_text, body_html = _parent_bodies(parsed)
+                    return {
+                        "thread_index": str(parsed.get("Thread-Index") or "").strip(),
+                        "from": str(parsed.get("From") or ""),
+                        "date": str(parsed.get("Date") or ""),
+                        "to": str(parsed.get("To") or ""),
+                        "cc": str(parsed.get("Cc") or ""),
+                        "subject": str(parsed.get("Subject") or ""),
+                        "body_text": body_text,
+                        "body_html": body_html,
+                    }
+                return None
+            finally:
+                await imap.logout()
+        except Exception as exc:
+            logger.warning(f"Parent lookup failed for {message_id}: {exc}")
+            return None
 
     def compose_message(
         self,
@@ -2150,6 +2332,7 @@ class EmailClient:
         references: str | None = None,
         include_bcc_header: bool = False,
         reply_to: str | None = None,
+        thread_index: str | None = None,
     ) -> MIMEText | MIMEMultipart:
         """Compose an email message without sending it.
 
@@ -2197,6 +2380,15 @@ class EmailClient:
         if reply_to:
             msg["Reply-To"] = reply_to
 
+        # Outlook/Exchange group conversations by Thread-Index (ConversationIndex),
+        # ignoring References/In-Reply-To — without it every message opens a new
+        # conversation. thread_index is the PARENT's index (reply); absent → new root.
+        child_index = _child_thread_index(thread_index) if thread_index else None
+        msg["Thread-Index"] = child_index or _new_thread_index()
+        topic = _normalize_thread_topic(subject)
+        msg["Thread-Topic"] = Header(topic, "utf-8") if any(ord(c) > 127 for c in topic) else topic
+
+
         # Set Date and Message-Id headers. The domain comes from the structured
         # sender address, never from the formatted RFC 5322 From header.
         msg["Date"] = email.utils.formatdate(localtime=True)
@@ -2229,10 +2421,22 @@ class EmailClient:
         in_reply_to: str | None = None,
         references: str | None = None,
         reply_to: str | None = None,
+        thread_index: str | None = None,
     ) -> DeliveryMutationOutcome:
         """Run one SMTP transaction and preserve phase-specific delivery evidence."""
         msg = self.compose_message(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, False, reply_to
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            False,
+            reply_to,
+            thread_index,
         )
         all_recipients = [*recipients, *(cc or []), *(bcc or [])]
         envelope_recipients = [email.utils.parseaddr(recipient)[1] for recipient in all_recipients]
@@ -2431,9 +2635,21 @@ class EmailClient:
         in_reply_to: str | None = None,
         references: str | None = None,
         reply_to: str | None = None,
+        thread_index: str | None = None,
     ) -> MIMEText | MIMEMultipart:
         msg = self.compose_message(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, False, reply_to
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            False,
+            reply_to,
+            thread_index=thread_index,
         )
         all_recipients = [*recipients, *(cc or []), *(bcc or [])]
         session_phase = "connect"
@@ -3354,6 +3570,25 @@ class ClassicEmailHandler(EmailHandler):
             failed_ids=failed_ids,
         )
 
+    async def _resolve_reply(
+        self, body: str, html: bool, in_reply_to: str | None, quote_history: bool
+    ) -> tuple[str, str | None]:
+        """For replies: fetch the parent from the mailbox (IMAP — hence the
+        incoming client; the outgoing one only knows the SMTP server) and return
+        (body with the quoted history appended, parent's Thread-Index).
+        Non-replies and unresolvable parents pass the body through unchanged."""
+        if not in_reply_to:
+            return body, None
+        parent = await self.incoming_client._lookup_parent(
+            in_reply_to,
+            mailboxes=tuple(m for m in ("INBOX", self.sent_folder_name, "Sent Items") if m),
+        )
+        if not parent:
+            return body, None
+        if quote_history:
+            body = _quote_history_html(body, parent) if html else _quote_history_plain(body, parent)
+        return body, parent.get("thread_index") or None
+
     async def send_email(
         self,
         recipients: list[str],
@@ -3366,12 +3601,25 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         reply_to: str | None = None,
+        quote_history: bool = True,
     ) -> None:
         if self.outgoing_client is None:
             raise RuntimeError(f"SMTP is not configured for account '{self.email_settings.account_name}'")
 
+        body, thread_index = await self._resolve_reply(body, html, in_reply_to, quote_history)
+
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, reply_to
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            reply_to,
+            thread_index=thread_index,
         )
 
         # Save to Sent folder if enabled
@@ -3403,6 +3651,7 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         flags: list[str] | None = None,
+        quote_history: bool = True,
     ) -> str:
         """Compose and save an email to the specified IMAP mailbox.
 
@@ -3417,6 +3666,8 @@ class ClassicEmailHandler(EmailHandler):
             ValueError: If any flag in *flags* is invalid per RFC 3501.
             RuntimeError: If the IMAP APPEND operation fails.
         """
+        body, thread_index = await self._resolve_reply(body, html, in_reply_to, quote_history)
+
         msg = self.incoming_client.compose_message(
             recipients,
             subject,
@@ -3428,6 +3679,7 @@ class ClassicEmailHandler(EmailHandler):
             in_reply_to,
             references,
             include_bcc_header=True,
+            thread_index=thread_index,
         )
 
         flags_str = r"(\Draft \Seen)" if flags is None else _validate_flags(flags)
