@@ -143,3 +143,5 @@ local/
 config.toml
 .worktrees/
 local-reference/
+scratchpad/
+.codegraph/
