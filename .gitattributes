@@ -10,3 +10,5 @@
 /mcp_email_server/web_ui/static/**/*.html text eol=lf
 /mcp_email_server/web_ui/static/**/*.js text eol=lf
 /mcp_email_server/web_ui/static/**/*.md text eol=lf
+/run.cmd text eol=crlf
+/run.sh text eol=lf
