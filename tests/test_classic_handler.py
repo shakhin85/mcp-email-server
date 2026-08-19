@@ -2,12 +2,18 @@ from datetime import UTC, datetime
 from email import policy
 from email.message import EmailMessage
 from email.parser import Parser
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mcp_email_server.config import EmailServer, EmailSettings
-from mcp_email_server.emails.classic import ClassicEmailHandler, EmailClient
+from mcp_email_server.emails.classic import (
+    ClassicEmailHandler,
+    EmailClient,
+    _quote_history_html,
+    _quote_history_plain,
+)
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -261,6 +267,7 @@ class TestClassicEmailHandler:
                 None,
                 None,
                 None,
+                thread_index=None,
             )
 
     @pytest.mark.asyncio
@@ -295,7 +302,85 @@ class TestClassicEmailHandler:
                 None,
                 None,
                 None,
+                thread_index=None,
             )
+
+    @pytest.mark.asyncio
+    async def test_send_email_reply_quotes_history(self, classic_handler):
+        """A reply looks up the parent, joins its thread and quotes its body."""
+        parent = {
+            "thread_index": "AdX0parentIndex==",
+            "from": "Alice <alice@example.com>",
+            "date": "Mon, 27 Jul 2026 10:00:00 +0300",
+            "to": "Bob <bob@example.com>",
+            "cc": "",
+            "subject": "Original subject",
+            "body_text": "Original body",
+            "body_html": "",
+        }
+        mock_send = AsyncMock()
+        mock_lookup = AsyncMock(return_value=parent)
+
+        with (
+            patch.object(classic_handler.outgoing_client, "send_email", mock_send),
+            patch.object(classic_handler.incoming_client, "_lookup_parent", mock_lookup),
+        ):
+            await classic_handler.send_email(
+                recipients=["bob@example.com"],
+                subject="Re: Original subject",
+                body="My reply",
+                in_reply_to="<parent@example.com>",
+            )
+
+        mock_lookup.assert_awaited_once()
+        sent_body = mock_send.call_args.args[2]
+        assert sent_body.startswith("My reply")
+        assert "From: Alice <alice@example.com>" in sent_body
+        assert "Subject: Original subject" in sent_body
+        assert "Original body" in sent_body
+        assert mock_send.call_args.kwargs["thread_index"] == "AdX0parentIndex=="
+
+    @pytest.mark.asyncio
+    async def test_send_email_reply_quote_history_disabled(self, classic_handler):
+        """quote_history=False keeps the body as-is but still threads the reply."""
+        parent = {"thread_index": "AdX0parentIndex==", "body_text": "Original body"}
+        mock_send = AsyncMock()
+        mock_lookup = AsyncMock(return_value=parent)
+
+        with (
+            patch.object(classic_handler.outgoing_client, "send_email", mock_send),
+            patch.object(classic_handler.incoming_client, "_lookup_parent", mock_lookup),
+        ):
+            await classic_handler.send_email(
+                recipients=["bob@example.com"],
+                subject="Re: Original subject",
+                body="My reply",
+                in_reply_to="<parent@example.com>",
+                quote_history=False,
+            )
+
+        assert mock_send.call_args.args[2] == "My reply"
+        assert mock_send.call_args.kwargs["thread_index"] == "AdX0parentIndex=="
+
+    @pytest.mark.asyncio
+    async def test_send_email_reply_parent_not_found(self, classic_handler):
+        """No parent in any mailbox → body unchanged, new conversation root."""
+        mock_send = AsyncMock()
+        mock_lookup = AsyncMock(return_value=None)
+
+        with (
+            patch.object(classic_handler.outgoing_client, "send_email", mock_send),
+            patch.object(classic_handler.incoming_client, "_lookup_parent", mock_lookup),
+        ):
+            await classic_handler.send_email(
+                recipients=["bob@example.com"],
+                subject="Re: Original subject",
+                body="My reply",
+                in_reply_to="<parent@example.com>",
+            )
+
+        assert mock_send.call_args.args[2] == "My reply"
+        assert mock_send.call_args.kwargs["thread_index"] is None
 
     @pytest.mark.asyncio
     async def test_read_only_account_rejects_send_email(self):
@@ -1072,3 +1157,45 @@ class TestGetEmailsContentEdgeCases:
                 result = await classic_handler.get_emails_content(["1"], mark_as_read=True)
         assert result.retrieved_count == 1
         assert mock_get.call_args.args == ("1", "INBOX", False)
+
+
+class TestQuoteHistory:
+    """Formatting of the quoted parent appended to reply bodies."""
+
+    PARENT: ClassVar[dict[str, str]] = {
+        "from": "Alice <alice@example.com>",
+        "date": "Mon, 27 Jul 2026 10:00:00 +0300",
+        "to": "Bob <bob@example.com>",
+        "cc": "Carol <carol@example.com>",
+        "subject": "Original subject",
+        "body_text": "Line one\nLine two",
+        "body_html": "<html><body><p>Line one</p></body></html>",
+    }
+
+    def test_plain_includes_divider_headers_and_body(self):
+        result = _quote_history_plain("My reply", self.PARENT)
+        assert result.startswith("My reply\n\n" + "_" * 32 + "\n")
+        assert "From: Alice <alice@example.com>" in result
+        assert "Sent: Mon, 27 Jul 2026 10:00:00 +0300" in result
+        assert "Cc: Carol <carol@example.com>" in result
+        assert "Subject: Original subject" in result
+        assert result.rstrip().endswith("Line one\nLine two")
+
+    def test_plain_skips_empty_cc_and_falls_back_to_html_body(self):
+        parent = {**self.PARENT, "cc": "", "body_text": ""}
+        result = _quote_history_plain("My reply", parent)
+        assert "Cc:" not in result
+        assert "Line one" in result  # extracted from body_html
+
+    def test_html_escapes_headers_and_unwraps_parent_document(self):
+        result = _quote_history_html("<p>My reply</p>", self.PARENT)
+        assert result.startswith("<p>My reply</p><br><br>")
+        assert "<b>From:</b> Alice &lt;alice@example.com&gt;" in result
+        # Parent's <html>/<body> wrapper is stripped; inner content kept.
+        assert "<html>" not in result
+        assert "<p>Line one</p>" in result
+
+    def test_html_falls_back_to_escaped_text_body(self):
+        parent = {**self.PARENT, "body_html": "", "body_text": "a < b\nnext"}
+        result = _quote_history_html("<p>My reply</p>", parent)
+        assert "a &lt; b<br>\nnext" in result

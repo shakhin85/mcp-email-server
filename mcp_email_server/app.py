@@ -518,7 +518,7 @@ async def send_email(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.attachments,
-            description="A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended.",
+            description='A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended. With html=True, an image referenced in the body as <img src="cid:<basename>"> is embedded inline instead of attached.',
         ),
     ] = None,
     in_reply_to: Annotated[
@@ -545,6 +545,13 @@ async def send_email(
             description="Email address to set as the Reply-To header. When set, email clients will reply to this address instead of the From address.",
         ),
     ] = None,
+    quote_history: Annotated[
+        bool,
+        Field(
+            default=True,
+            description="When replying (in_reply_to set), append the quoted parent message below the body, Outlook-style (From/Sent/To/Subject header block + original body). Set False to send the body as-is.",
+        ),
+    ] = True,
 ) -> str:
     try:
         outcome = await send_email_command(
@@ -560,6 +567,7 @@ async def send_email(
                 in_reply_to=in_reply_to,
                 references=references,
                 reply_to=reply_to,
+                quote_history=quote_history,
             )
         )
     except RecipientPolicyDeniedError as exc:
@@ -627,7 +635,7 @@ async def save_to_mailbox(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.attachments,
-            description="A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended.",
+            description='A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended. With html=True, an image referenced in the body as <img src="cid:<basename>"> is embedded inline instead of attached.',
         ),
     ] = None,
     in_reply_to: Annotated[
@@ -654,6 +662,13 @@ async def save_to_mailbox(
             description=r"IMAP flags to set on the message. Defaults to ['\Draft', '\Seen']. Common flags: '\Draft', '\Seen', '\Flagged'.",
         ),
     ] = None,
+    quote_history: Annotated[
+        bool,
+        Field(
+            default=True,
+            description="When replying (in_reply_to set), append the quoted parent message below the body, Outlook-style (From/Sent/To/Subject header block + original body). Set False to save the body as-is.",
+        ),
+    ] = True,
 ) -> str:
     try:
         outcome = await save_to_mailbox_command(
@@ -670,6 +685,7 @@ async def save_to_mailbox(
                 in_reply_to=in_reply_to,
                 references=references,
                 flags=tuple(flags) if flags is not None else None,
+                quote_history=quote_history,
             )
         )
     except RecipientPolicyDeniedError as exc:

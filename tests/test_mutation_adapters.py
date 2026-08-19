@@ -91,6 +91,7 @@ async def test_mutation_adapter_composes_and_appends_mailbox_message(
     outcome = AppendMutationOutcome("succeeded", "message-id", mailbox="Drafts")
     handler = MagicMock()
     handler.email_settings = email_settings
+    handler.resolve_reply = AsyncMock(return_value=("Body", None))
     handler.incoming_client.compose_message = Mock(return_value=message)
     handler.incoming_client.append_to_mailbox_with_outcome = AsyncMock(return_value=outcome)
     provider = ClassicMutationProvider(handler)
@@ -115,6 +116,7 @@ async def test_mutation_adapter_composes_and_appends_mailbox_message(
         None,
         None,
         include_bcc_header=True,
+        thread_index=None,
     )
     handler.incoming_client.append_to_mailbox_with_outcome.assert_awaited_once_with(
         message,
@@ -195,3 +197,29 @@ async def test_mutation_adapter_appends_local_sent_copy_without_overwriting_bcc(
         email_settings.incoming,
         "Sent",
     )
+
+
+@pytest.mark.asyncio
+async def test_mutation_adapter_threads_and_quotes_reply(email_settings: EmailSettings) -> None:
+    """quote_history and the parent's Thread-Index reach compose_message."""
+    message = MIMEText("body")
+    outcome = AppendMutationOutcome("succeeded", "message-id", mailbox="Drafts")
+    handler = MagicMock()
+    handler.email_settings = email_settings
+    handler.resolve_reply = AsyncMock(return_value=("Body\n\nquoted parent", "AdX0parentIndex=="))
+    handler.incoming_client.compose_message = Mock(return_value=message)
+    handler.incoming_client.append_to_mailbox_with_outcome = AsyncMock(return_value=outcome)
+    provider = ClassicMutationProvider(handler)
+    command = SaveToMailboxCommand(
+        "primary",
+        ("recipient@example.test",),
+        "Subject",
+        "Body",
+        in_reply_to="<parent@example.test>",
+        quote_history=False,
+    )
+
+    assert await provider.save_to_mailbox(command, _account()) is outcome
+    handler.resolve_reply.assert_awaited_once_with("Body", False, "<parent@example.test>", False)
+    assert handler.incoming_client.compose_message.call_args.args[2] == "Body\n\nquoted parent"
+    assert handler.incoming_client.compose_message.call_args.kwargs["thread_index"] == "AdX0parentIndex=="

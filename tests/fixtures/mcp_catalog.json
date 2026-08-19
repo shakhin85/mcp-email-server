@@ -825,7 +825,7 @@
                             }
                         ],
                         "default": null,
-                        "description": "A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended.",
+                        "description": "A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended. With html=True, an image referenced in the body as <img src=\"cid:<basename>\"> is embedded inline instead of attached.",
                         "title": "Attachments"
                     },
                     "in_reply_to": {
@@ -869,6 +869,12 @@
                         "default": null,
                         "description": "Email address to set as the Reply-To header. When set, email clients will reply to this address instead of the From address.",
                         "title": "Reply To"
+                    },
+                    "quote_history": {
+                        "default": true,
+                        "description": "When replying (in_reply_to set), append the quoted parent message below the body, Outlook-style (From/Sent/To/Subject header block + original body). Set False to send the body as-is.",
+                        "title": "Quote History",
+                        "type": "boolean"
                     }
                 },
                 "required": ["account_name", "recipients", "subject", "body"],
@@ -991,7 +997,7 @@
                             }
                         ],
                         "default": null,
-                        "description": "A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended.",
+                        "description": "A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended. With html=True, an image referenced in the body as <img src=\"cid:<basename>\"> is embedded inline instead of attached.",
                         "title": "Attachments"
                     },
                     "in_reply_to": {
@@ -1039,6 +1045,12 @@
                         "default": null,
                         "description": "IMAP flags to set on the message. Defaults to ['\\Draft', '\\Seen']. Common flags: '\\Draft', '\\Seen', '\\Flagged'.",
                         "title": "Flags"
+                    },
+                    "quote_history": {
+                        "default": true,
+                        "description": "When replying (in_reply_to set), append the quoted parent message below the body, Outlook-style (From/Sent/To/Subject header block + original body). Set False to save the body as-is.",
+                        "title": "Quote History",
+                        "type": "boolean"
                     }
                 },
                 "required": ["account_name", "recipients", "subject", "body"],

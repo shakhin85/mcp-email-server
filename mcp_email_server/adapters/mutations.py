@@ -81,10 +81,18 @@ class ClassicMutationProvider:
         account: MutationAccountSnapshot,
     ) -> AppendMutationOutcome:
         del account
+        body, thread_index = await _bounded_mutation_call(
+            self._handler.resolve_reply(
+                command.body,
+                command.html,
+                command.in_reply_to,
+                command.quote_history,
+            )
+        )
         message = self._handler.incoming_client.compose_message(
             list(command.recipients),
             command.subject,
-            command.body,
+            body,
             list(command.cc) or None,
             list(command.bcc) or None,
             command.html,
@@ -92,6 +100,7 @@ class ClassicMutationProvider:
             command.in_reply_to,
             command.references,
             include_bcc_header=True,
+            thread_index=thread_index,
         )
         flags = r"(\Draft \Seen)" if command.flags is None else _validate_flags(list(command.flags))
         return await _bounded_mutation_call(
@@ -149,11 +158,19 @@ class ClassicMutationProvider:
         client = self._handler.outgoing_client
         if client is None:
             raise MutationProviderError("capability_unavailable: SMTP is not configured for this account")
+        body, thread_index = await _bounded_mutation_call(
+            self._handler.resolve_reply(
+                command.body,
+                command.html,
+                command.in_reply_to,
+                command.quote_history,
+            )
+        )
         return await _bounded_mutation_call(
             client.send_email_with_outcome(
                 list(command.recipients),
                 command.subject,
-                command.body,
+                body,
                 list(command.cc) or None,
                 list(command.bcc) or None,
                 command.html,
@@ -161,6 +178,7 @@ class ClassicMutationProvider:
                 command.in_reply_to,
                 command.references,
                 command.reply_to,
+                thread_index=thread_index,
             )
         )
 
