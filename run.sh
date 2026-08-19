@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Wrapper: подтягивает пароль из secret-файла (chmod 600), env — из ~/.claude.json.
-# Пароль НЕ хранится в конфиге и не проходит через агента.
+# Wrapper: pulls the password from a secret file; env comes from the MCP config.
+# The password never lives in the config and never passes through the agent.
 set -euo pipefail
-export MCP_EMAIL_SERVER_PASSWORD="$(cat "$HOME/.config/mcp-email/password")"
-exec uv run --directory /home/linux_admin/projects/mcp-email-server mcp-email-server stdio
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+secret="${MCP_EMAIL_SERVER_PASSWORD_FILE:-$HOME/.config/mcp-email/password}"
+if [[ ! -f "$secret" ]]; then
+  echo "run.sh: secret file not found: $secret" >&2
+  exit 1
+fi
+export MCP_EMAIL_SERVER_PASSWORD="$(<"$secret")"
+exec uv run --directory "$here" mcp-email-server stdio
