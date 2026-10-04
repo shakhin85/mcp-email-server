@@ -624,6 +624,68 @@ def _html_to_text(html: str) -> str:
 
 _THREAD_TOPIC_PREFIX = re.compile(r"^(?:re|fw|fwd|отв|пересл)\s*:\s*", re.IGNORECASE)
 
+_MENTION_RE = re.compile(r"\{@([^}\s]+)\}")
+
+
+def _apply_mentions(  # noqa: C901
+    body: str,
+    html: bool,
+    recipients: list[str],
+    cc: list[str] | None,
+    mentions: list[str],
+) -> tuple[list[str], list[str] | None, str]:
+    from email.utils import getaddresses
+
+    from mcp_email_server.config import normalize_address
+
+    raw_lists: list[list[str]] = [recipients]
+    if cc:
+        raw_lists.append(cc)
+    display: dict[str, str] = {}
+    for raw_list in raw_lists:
+        for display_name, address in getaddresses(raw_list):
+            normed = normalize_address(address) if address else ""
+            if normed and normed not in display:
+                display[normed] = display_name
+
+    def _render_one(addr: str, mention_id: str) -> str:
+        normed = normalize_address(addr)
+        name = display.get(normed) or (addr.split("@", 1)[0] if normed else addr)
+        if html:
+            return (
+                '<a id="OWAAM' + mention_id + 'Z" href="mailto:' + addr + '">'
+                '<span style=\'font-family:"Calibri",sans-serif;text-decoration:none\'>'
+                "@" + escape_html(name) + "</span></a>"
+            )
+        return "@" + name + " (" + addr + ")"
+
+    mention_ids: dict[str, str] = {}
+    for addr in mentions:
+        mention_ids[normalize_address(addr)] = uuid.uuid4().hex.upper()
+
+    def _replace(match: re.Match[str]) -> str:
+        candidate = match.group(1)
+        normed = normalize_address(candidate) if candidate else ""
+        return _render_one(candidate, mention_ids.get(normed, ""))
+
+    body = _MENTION_RE.sub(_replace, body)
+
+    existing: set[str] = set()
+    for raw_list in raw_lists:
+        for _, address in getaddresses(raw_list):
+            normed = normalize_address(address) if address else ""
+            if normed:
+                existing.add(normed)
+
+    new_recipients = list(recipients)
+    for addr in mentions:
+        normed = normalize_address(addr) if addr else ""
+        if normed and normed not in existing:
+            new_recipients.append(addr)
+            existing.add(normed)
+
+    return new_recipients, cc, body
+
 
 def _normalize_thread_topic(subject: str) -> str:
     """Subject without Re:/Fwd: prefixes — Outlook's ConversationTopic."""
@@ -2317,7 +2379,7 @@ class EmailClient:
             logger.warning(f"Parent lookup failed for {message_id}: {exc}")
             return None
 
-    def compose_message(
+    def compose_message(  # noqa: C901
         self,
         recipients: list[str],
         subject: str,
@@ -2331,6 +2393,7 @@ class EmailClient:
         include_bcc_header: bool = False,
         reply_to: str | None = None,
         thread_index: str | None = None,
+        mentions: list[str] | None = None,
     ) -> MIMEText | MIMEMultipart:
         """Compose an email message without sending it.
 
@@ -2342,7 +2405,15 @@ class EmailClient:
         can display the BCC recipients.  When False (default, used for SMTP
         sending), the Bcc header is omitted — BCC recipients are delivered
         via the SMTP envelope only.
+
+        *mentions*: list of email addresses to @-mention in the body. ``{@addr}``
+        placeholders in the HTML/plain-text body are replaced with Outlook-style
+        mention markup. Mentioned addresses are automatically added to To when not
+        already present in To or Cc.
         """
+        if mentions:
+            recipients, cc, body = _apply_mentions(body, html, recipients, cc, mentions)
+
         envelope_sender = self.envelope_sender
 
         if attachments:
@@ -2397,6 +2468,9 @@ class EmailClient:
         msg["User-Agent"] = "mcp-email-server"
         msg["X-Mailer"] = "mcp-email-server"
 
+        if mentions:
+            msg["X-Mentions"] = ", ".join(mentions)
+
         # Policy must follow every address-bearing and threading header, not
         # only the SMTP envelope sender. This also keeps later Sent/Draft
         # serialization from downgrading an internationalized addr-spec into an
@@ -2419,6 +2493,7 @@ class EmailClient:
         references: str | None = None,
         reply_to: str | None = None,
         thread_index: str | None = None,
+        mentions: list[str] | None = None,
     ) -> DeliveryMutationOutcome:
         """Run one SMTP transaction and preserve phase-specific delivery evidence."""
         msg = self.compose_message(
@@ -2434,6 +2509,7 @@ class EmailClient:
             False,
             reply_to,
             thread_index,
+            mentions,
         )
         all_recipients = [*recipients, *(cc or []), *(bcc or [])]
         envelope_recipients = [email.utils.parseaddr(recipient)[1] for recipient in all_recipients]
@@ -2633,6 +2709,7 @@ class EmailClient:
         references: str | None = None,
         reply_to: str | None = None,
         thread_index: str | None = None,
+        mentions: list[str] | None = None,
     ) -> MIMEText | MIMEMultipart:
         msg = self.compose_message(
             recipients,
@@ -2647,6 +2724,7 @@ class EmailClient:
             False,
             reply_to,
             thread_index,
+            mentions,
         )
         all_recipients = [*recipients, *(cc or []), *(bcc or [])]
         session_phase = "connect"
@@ -3599,6 +3677,7 @@ class ClassicEmailHandler(EmailHandler):
         references: str | None = None,
         reply_to: str | None = None,
         quote_history: bool = True,
+        mentions: list[str] | None = None,
     ) -> None:
         if self.outgoing_client is None:
             raise RuntimeError(f"SMTP is not configured for account '{self.email_settings.account_name}'")
@@ -3617,6 +3696,7 @@ class ClassicEmailHandler(EmailHandler):
             references,
             reply_to,
             thread_index=thread_index,
+            mentions=mentions,
         )
 
         # Save to Sent folder if enabled
@@ -3649,6 +3729,7 @@ class ClassicEmailHandler(EmailHandler):
         references: str | None = None,
         flags: list[str] | None = None,
         quote_history: bool = True,
+        mentions: list[str] | None = None,
     ) -> str:
         """Compose and save an email to the specified IMAP mailbox.
 
@@ -3677,6 +3758,7 @@ class ClassicEmailHandler(EmailHandler):
             references,
             include_bcc_header=True,
             thread_index=thread_index,
+            mentions=mentions,
         )
 
         flags_str = r"(\Draft \Seen)" if flags is None else _validate_flags(flags)

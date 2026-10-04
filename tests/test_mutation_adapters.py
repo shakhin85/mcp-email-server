@@ -117,6 +117,7 @@ async def test_mutation_adapter_composes_and_appends_mailbox_message(
         None,
         include_bcc_header=True,
         thread_index=None,
+        mentions=None,
     )
     handler.incoming_client.append_to_mailbox_with_outcome.assert_awaited_once_with(
         message,

@@ -268,6 +268,7 @@ class TestClassicEmailHandler:
                 None,
                 None,
                 thread_index=None,
+                mentions=None,
             )
 
     @pytest.mark.asyncio
@@ -303,6 +304,7 @@ class TestClassicEmailHandler:
                 None,
                 None,
                 thread_index=None,
+                mentions=None,
             )
 
     @pytest.mark.asyncio

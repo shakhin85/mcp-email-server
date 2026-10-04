@@ -8,7 +8,7 @@ import pytest
 
 from mcp_email_server.application.mutations import AppendMutationOutcome
 from mcp_email_server.config import EmailServer, EmailSettings
-from mcp_email_server.emails.classic import ClassicEmailHandler, EmailClient, _validate_flags
+from mcp_email_server.emails.classic import ClassicEmailHandler, EmailClient, _apply_mentions, _validate_flags
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -589,3 +589,192 @@ async def test_save_to_mailbox_tool_custom_folder(monkeypatch):
     command = command_handler.await_args.args[0]
     assert command.mailbox == "INBOX.Drafts"
     assert command.flags == (r"\Draft", r"\Seen")
+
+
+# ---------------------------------------------------------------------------
+# Cycle 3: Mentions
+# ---------------------------------------------------------------------------
+
+
+class TestMentionsBodyBuilding:
+    def test_html_mention_markup(self, email_client):
+        body = "Hello {@bob@example.com}! Welcome."
+        _recipients, _cc, new_body = _apply_mentions(
+            body, True, ["alice@example.com"], None, ["bob@example.com"]
+        )
+        assert 'id="OWAAM' in new_body
+        assert 'Z" href="mailto:bob@example.com"' in new_body
+        assert "@bob" in new_body
+        assert "Hello " in new_body
+        assert "! Welcome." in new_body
+
+    def test_html_mention_escapes_name(self, email_client):
+        body = "Hey {@x@example.com}"
+        _recipients, _cc, new_body = _apply_mentions(
+            body, True, ['"Bob <script>" <x@example.com>'], None, ["x@example.com"]
+        )
+        assert "<script>" not in new_body
+        assert "&lt;script&gt;" in new_body
+
+    def test_plain_text_mention_format(self, email_client):
+        body = "Note: {@carol@example.com} please review."
+        _recipients, _cc, new_body = _apply_mentions(
+            body, False, ["alice@example.com"], None, ["carol@example.com"]
+        )
+        assert "@carol (carol@example.com)" in new_body
+        assert "id=" not in new_body
+
+    def test_mention_with_display_name_from_cc(self, email_client):
+        body = "CC: {@user@example.com}"
+        _recipients, _cc, new_body = _apply_mentions(
+            body, True, ["alice@example.com"], ['"User Name" <user@example.com>'], ["user@example.com"]
+        )
+        assert "@User Name" in new_body
+        assert 'mailto:user@example.com' in new_body
+
+    def test_mention_fallback_to_local_part(self, email_client):
+        body = "{@stranger@example.com}"
+        _recipients, _cc, new_body = _apply_mentions(
+            body, True, ["alice@example.com"], None, ["stranger@example.com"]
+        )
+        assert "stranger@example.com" in new_body
+        assert "@stranger" in new_body
+
+    def test_no_mentions_passes_body_unchanged(self, email_client):
+        body = "Plain body no mentions."
+        _recipients, _cc, new_body = _apply_mentions(
+            body, True, ["alice@example.com"], None, []
+        )
+        assert new_body == body
+
+    def test_mention_without_placeholder_not_replaced(self, email_client):
+        body = "No curly braces here."
+        _recipients, _cc, new_body = _apply_mentions(
+            body, True, ["alice@example.com"], None, ["bob@example.com"]
+        )
+        assert new_body == body
+
+    def test_unique_owaam_id_per_mention(self, email_client):
+        body = "{@a@x.com} {@b@x.com} {@c@x.com}"
+        _recipients, _cc, new_body = _apply_mentions(
+            body, True, ["alice@x.com"], None, ["a@x.com", "b@x.com", "c@x.com"]
+        )
+        import re
+        ids = re.findall(r'OWAAM([A-F0-9]+)Z', new_body)
+        assert len(ids) == 3
+        assert len(set(ids)) == 3
+        for owa_id in ids:
+            assert len(owa_id) == 32
+
+    def test_placeholder_for_unknown_address_renders_empty_id(self, email_client):
+        body = "{@unknown@x.com}"
+        _recipients, _cc, new_body = _apply_mentions(
+            body, True, ["alice@x.com"], None, ["known@x.com"]
+        )
+        assert 'mailto:unknown@x.com' in new_body
+        assert 'OWAAMZ' in new_body
+
+
+class TestMentionsRecipients:
+    def test_mention_adds_to_recipients_when_absent(self, email_client):
+        body = "{@bob@example.com}"
+        recipients, _cc, _new_body = _apply_mentions(
+            body, True, ["alice@example.com"], None, ["bob@example.com"]
+        )
+        assert "bob@example.com" in recipients
+        assert "alice@example.com" in recipients
+        assert len(recipients) == 2
+
+    def test_mention_does_not_duplicate_existing_recipient(self, email_client):
+        body = "{@bob@example.com}"
+        recipients, _cc, _new_body = _apply_mentions(
+            body, True, ["bob@example.com"], None, ["bob@example.com"]
+        )
+        assert recipients.count("bob@example.com") == 1
+        assert len(recipients) == 1
+
+    def test_mention_does_not_duplicate_existing_cc(self, email_client):
+        body = "{@bob@example.com}"
+        recipients, cc, _new_body = _apply_mentions(
+            body, True, ["alice@example.com"], ["bob@example.com"], ["bob@example.com"]
+        )
+        assert "bob@example.com" not in recipients
+        assert cc is not None and "bob@example.com" in cc
+
+    def test_mention_is_case_insensitive_for_existing(self, email_client):
+        body = "{@Bob@Example.com}"
+        recipients, _cc, _new_body = _apply_mentions(
+            body, True, ["bob@example.com"], None, ["Bob@Example.com"]
+        )
+        assert len(recipients) == 1
+
+    def test_cc_unchanged(self, email_client):
+        body = "{@a@x.com}"
+        _recipients, cc, _new_body = _apply_mentions(
+            body, True, ["r@x.com"], ["c@x.com"], ["a@x.com"]
+        )
+        assert cc == ["c@x.com"]
+
+    def test_x_mentions_header_in_composed_message(self, email_client):
+        msg = email_client.compose_message(
+            ["alice@example.com"], "Subject", "Hello {@bob@example.com}",
+            mentions=["bob@example.com"],
+        )
+        assert msg["X-Mentions"] == "bob@example.com"
+
+    def test_x_mentions_header_multiple(self, email_client):
+        msg = email_client.compose_message(
+            ["alice@example.com"], "Subject", "{@a@x.com} and {@b@x.com}",
+            mentions=["a@x.com", "b@x.com"],
+        )
+        assert msg["X-Mentions"] == "a@x.com, b@x.com"
+
+
+class TestMentionsAllowlist:
+    @pytest.mark.asyncio
+    async def test_send_email_rejects_blocked_mentioned_recipient(self):
+        from unittest.mock import AsyncMock
+
+        from mcp_email_server.application.mutations import (
+            RecipientPolicyDeniedError,
+        )
+
+        with patch("mcp_email_server.app.get_application_runtime") as mock_runtime:
+            mock_send = AsyncMock()
+            mock_send.execute = AsyncMock(
+                side_effect=RecipientPolicyDeniedError("recipient policy denied one or more addresses")
+            )
+            mock_runtime.return_value.mutations.send = mock_send
+
+            from mcp_email_server.app import send_email
+            with pytest.raises(ValueError, match=r"Recipient.*not in allowlist"):
+                await send_email(
+                    "test",
+                    ["alice@example.com"],
+                    "Subject",
+                    "Hello {@bob@example.com}",
+                    mentions=["bob@example.com"],
+                )
+
+    @pytest.mark.asyncio
+    async def test_save_to_mailbox_rejects_blocked_mentioned_recipient(self):
+        from unittest.mock import AsyncMock
+
+        from mcp_email_server.application.mutations import RecipientPolicyDeniedError
+
+        with patch("mcp_email_server.app.get_application_runtime") as mock_runtime:
+            mock_save = AsyncMock()
+            mock_save.execute = AsyncMock(
+                side_effect=RecipientPolicyDeniedError("recipient policy denied one or more addresses")
+            )
+            mock_runtime.return_value.mutations.save_to_mailbox = mock_save
+
+            from mcp_email_server.app import save_to_mailbox
+            with pytest.raises(ValueError, match=r"Recipient.*not in allowlist"):
+                await save_to_mailbox(
+                    "test",
+                    ["alice@example.com"],
+                    "Subject",
+                    "Hello {@bob@example.com}",
+                    mentions=["bob@example.com"],
+                )

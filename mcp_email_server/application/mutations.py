@@ -224,10 +224,11 @@ class ComposeCommand:
     in_reply_to: str | None = None
     references: str | None = None
     quote_history: bool = True
+    mentions: tuple[str, ...] = ()
 
     def validate(self) -> None:
         _validate_account_name(self.account_name)
-        _validate_recipients((*self.recipients, *self.cc, *self.bcc))
+        _validate_recipients((*self.recipients, *self.cc, *self.bcc, *self.mentions))
         _validate_content(self.subject, self.body, self.attachments)
         _validate_optional_header("in_reply_to", self.in_reply_to)
         _validate_optional_header("references", self.references)
@@ -452,7 +453,7 @@ def _recipient_policy_allows(recipient: str, allowed: tuple[str, ...]) -> bool:
 def _validate_recipient_policy(command: ComposeCommand, account: MutationAccountSnapshot) -> None:
     blocked = [
         recipient
-        for recipient in (*command.recipients, *command.cc, *command.bcc)
+        for recipient in (*command.recipients, *command.cc, *command.bcc, *command.mentions)
         if not _recipient_policy_allows(recipient, account.allowed_recipients)
     ]
     if blocked:

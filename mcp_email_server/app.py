@@ -552,6 +552,14 @@ async def send_email(
             description="When replying (in_reply_to set), append the quoted parent message below the body, Outlook-style (From/Sent/To/Subject header block + original body). Set False to send the body as-is.",
         ),
     ] = True,
+    mentions: Annotated[
+        list[AddressInput] | None,
+        Field(
+            default=None,
+            max_length=APPLICATION_LIMITS.recipients,
+            description="List of email addresses to @-mention in the body. Use {@addr} markup in body to place each mention. Rendered as Outlook-compatible mention links (OWAAM anchor with mailto). Display name resolved from To/Cc display-name, else local-part. Mentioned addresses are automatically added to To when not already in To or Cc (no duplicates). Allowlist applies to mentioned addresses.",
+        ),
+    ] = None,
 ) -> str:
     try:
         outcome = await send_email_command(
@@ -568,6 +576,7 @@ async def send_email(
                 references=references,
                 reply_to=reply_to,
                 quote_history=quote_history,
+                mentions=tuple(mentions or ()),
             )
         )
     except RecipientPolicyDeniedError as exc:
@@ -669,6 +678,14 @@ async def save_to_mailbox(
             description="When replying (in_reply_to set), append the quoted parent message below the body, Outlook-style (From/Sent/To/Subject header block + original body). Set False to save the body as-is.",
         ),
     ] = True,
+    mentions: Annotated[
+        list[AddressInput] | None,
+        Field(
+            default=None,
+            max_length=APPLICATION_LIMITS.recipients,
+            description="List of email addresses to @-mention in the body. Use {@addr} markup in body to place each mention. Rendered as Outlook-compatible mention links (OWAAM anchor with mailto). Display name resolved from To/Cc display-name, else local-part. Mentioned addresses are automatically added to To when not already in To or Cc (no duplicates). Allowlist applies to mentioned addresses.",
+        ),
+    ] = None,
 ) -> str:
     try:
         outcome = await save_to_mailbox_command(
@@ -686,6 +703,7 @@ async def save_to_mailbox(
                 references=references,
                 flags=tuple(flags) if flags is not None else None,
                 quote_history=quote_history,
+                mentions=tuple(mentions or ()),
             )
         )
     except RecipientPolicyDeniedError as exc:

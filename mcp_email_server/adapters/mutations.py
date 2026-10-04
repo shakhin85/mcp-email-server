@@ -101,6 +101,7 @@ class ClassicMutationProvider:
             command.references,
             include_bcc_header=True,
             thread_index=thread_index,
+            mentions=list(command.mentions) if command.mentions else None,
         )
         flags = r"(\Draft \Seen)" if command.flags is None else _validate_flags(list(command.flags))
         return await _bounded_mutation_call(
@@ -179,6 +180,7 @@ class ClassicMutationProvider:
                 command.references,
                 command.reply_to,
                 thread_index=thread_index,
+                mentions=list(command.mentions) if command.mentions else None,
             )
         )
 
