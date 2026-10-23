@@ -2786,28 +2786,40 @@ class EmailClient:
         # Return the message for potential saving to Sent folder
         return msg
 
-    async def _find_sent_folder_by_flag(self, imap, *, utf8: bool = False) -> str | None:
-        """Find the Sent folder by searching for the \\Sent IMAP flag.
+    async def _find_folder_by_flag(self, imap, flag: str, *, utf8: bool = False) -> str | None:
+        """Find a folder by its RFC 6154 special-use attribute (e.g. \\Sent, \\Drafts).
 
         Args:
             imap: Connected IMAP client
+            flag: Special-use attribute, matched case-insensitively
 
         Returns:
-            The folder name with the \\Sent flag, or None if not found
+            The folder name with the attribute, or None if not found
         """
         try:
             # List all folders - aioimaplib requires reference_name and mailbox_pattern
             _, folders = await imap.list('""', "*")
 
-            # Search for folder with the case-insensitive \Sent attribute.
             for mailbox in _parse_list_responses(folders, utf8=utf8):
-                if any(flag.casefold() == r"\sent" for flag in mailbox.flags):
-                    logger.info(f"Found Sent folder by \\Sent flag: '{mailbox.name}'")
+                if any(attr.casefold() == flag.casefold() for attr in mailbox.flags):
+                    logger.info(f"Found folder by {flag} flag: '{mailbox.name}'")
                     return mailbox.name
         except Exception as e:
-            logger.debug(f"Error finding Sent folder by flag: {e}")
+            logger.debug(f"Error finding folder by {flag} flag: {e}")
 
         return None
+
+    async def _resolve_drafts_folder(self, imap, *, utf8: bool) -> str:
+        """Return the \\Drafts special-use folder, or "Drafts" when the server marks none."""
+        folder = await self._find_folder_by_flag(imap, r"\Drafts", utf8=utf8)
+        if folder is not None:
+            try:
+                validate_mailbox_name(folder)
+            except ValueError:
+                logger.debug("Ignoring invalid provider-derived Drafts mailbox")
+            else:
+                return folder
+        return "Drafts"
 
     async def append_to_sent_with_outcome(  # noqa: C901 - mailbox discovery plus APPEND evidence
         self,
@@ -2842,8 +2854,9 @@ class EmailClient:
                 append_mode = await _prepare_imap_append(imap, msg)
             except ImapUtf8UnsupportedError:
                 return SentCopyMutationOutcome("failed", detail="utf8-append-unsupported")
-            flag_folder = await self._find_sent_folder_by_flag(
+            flag_folder = await self._find_folder_by_flag(
                 imap,
+                r"\Sent",
                 utf8=append_mode.session_utf8_enabled,
             )
             if flag_folder is not None and flag_folder not in folders:
@@ -2901,7 +2914,7 @@ class EmailClient:
         self,
         msg: MIMEText | MIMEMultipart,
         incoming_server: EmailServer,
-        mailbox: str,
+        mailbox: str | None,
         flags: str = r"(\Draft \Seen)",
     ) -> AppendMutationOutcome:
         """Append exactly once and distinguish rejection from a lost result."""
@@ -2914,6 +2927,8 @@ class EmailClient:
                 append_mode = await _prepare_imap_append(imap, msg)
             except ImapUtf8UnsupportedError:
                 return AppendMutationOutcome("failed", message_id, mailbox=mailbox, detail="utf8-append-unsupported")
+            if mailbox is None:
+                mailbox = await self._resolve_drafts_folder(imap, utf8=append_mode.session_utf8_enabled)
             select_result = await imap.select(_quote_mailbox(mailbox, utf8=append_mode.session_utf8_enabled))
             if _imap_status(select_result) != "OK":
                 return AppendMutationOutcome("failed", message_id, mailbox=mailbox, detail="mailbox-unavailable")
@@ -2953,11 +2968,11 @@ class EmailClient:
         finally:
             await _best_effort_imap_logout(imap)
 
-    async def append_to_mailbox(
+    async def append_to_mailbox(  # noqa: C901 - Drafts discovery plus APPEND evidence
         self,
         msg: MIMEText | MIMEMultipart,
         incoming_server: EmailServer,
-        mailbox: str,
+        mailbox: str | None,
         flags: str = r"(\Draft \Seen)",
     ) -> str | None:
         """Append a message to the specified IMAP folder.
@@ -2977,6 +2992,8 @@ class EmailClient:
             except ImapUtf8UnsupportedError:
                 logger.warning("IMAP server does not support internationalized mailbox APPEND")
                 return None
+            if mailbox is None:
+                mailbox = await self._resolve_drafts_folder(imap, utf8=append_mode.session_utf8_enabled)
 
             result = await imap.select(_quote_mailbox(mailbox, utf8=append_mode.session_utf8_enabled))
             status = result[0] if isinstance(result, tuple) else result
@@ -3728,7 +3745,7 @@ class ClassicEmailHandler(EmailHandler):
         recipients: list[str],
         subject: str,
         body: str,
-        mailbox: str = "Drafts",
+        mailbox: str | None = None,
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         html: bool = False,

@@ -901,8 +901,8 @@
                   "maxLength": 1024,
                   "type": "string"
                 },
-                "type": "array",
-                "maxItems": 100
+                "maxItems": 100,
+                "type": "array"
               },
               {
                 "type": "null"
@@ -944,7 +944,7 @@
     },
     {
       "name": "save_to_mailbox",
-      "description": "Compose an email and save it to an IMAP folder (e.g., Drafts). Shares recipient, body, attachment, and threading parameters with send_email; adds mailbox and flags, and does not support reply_to. Default folder is Drafts with \\Draft and \\Seen flags. Pure IMAP operation — works without SMTP configuration. An ambiguous APPEND is reported as unknown and is not retried automatically.",
+      "description": "Compose an email and save it to an IMAP folder (e.g., Drafts). Shares recipient, body, attachment, and threading parameters with send_email; adds mailbox and flags, and does not support reply_to. Default folder is the account's \\Drafts special-use folder (fallback 'Drafts') with \\Draft and \\Seen flags. Pure IMAP operation — works without SMTP configuration. An ambiguous APPEND is reported as unknown and is not retried automatically.",
       "inputSchema": {
         "properties": {
           "account_name": {
@@ -977,11 +977,18 @@
             "type": "string"
           },
           "mailbox": {
-            "default": "Drafts",
-            "description": "The IMAP folder to save to (e.g., 'Drafts', 'INBOX.Drafts', 'Templates').",
-            "maxLength": 1024,
-            "title": "Mailbox",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The IMAP folder to save to (e.g., 'Templates'). Omit to use the account's \\Drafts special-use folder.",
+            "title": "Mailbox"
           },
           "cc": {
             "anyOf": [
@@ -1102,8 +1109,8 @@
                   "maxLength": 1024,
                   "type": "string"
                 },
-                "type": "array",
-                "maxItems": 100
+                "maxItems": 100,
+                "type": "array"
               },
               {
                 "type": "null"

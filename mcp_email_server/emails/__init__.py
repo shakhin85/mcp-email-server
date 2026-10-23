@@ -107,7 +107,7 @@ class EmailHandler(abc.ABC):
         recipients: list[str],
         subject: str,
         body: str,
-        mailbox: str = "Drafts",
+        mailbox: str | None = None,
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         html: bool = False,

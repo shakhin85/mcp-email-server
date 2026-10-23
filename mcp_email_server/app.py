@@ -596,7 +596,7 @@ async def send_email(
     description="Compose an email and save it to an IMAP folder (e.g., Drafts). "
     "Shares recipient, body, attachment, and threading parameters with send_email; "
     "adds mailbox and flags, and does not support reply_to. "
-    "Default folder is Drafts with \\Draft and \\Seen flags. "
+    "Default folder is the account's \\Drafts special-use folder (fallback 'Drafts') with \\Draft and \\Seen flags. "
     "Pure IMAP operation — works without SMTP configuration. An ambiguous APPEND is reported as unknown "
     "and is not retried automatically.",
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
@@ -620,13 +620,13 @@ async def save_to_mailbox(
         Field(max_length=APPLICATION_LIMITS.body_bytes, description="The body of the email."),
     ],
     mailbox: Annotated[
-        str,
+        str | None,
         Field(
-            default="Drafts",
+            default=None,
             max_length=APPLICATION_LIMITS.mailbox_bytes,
-            description="The IMAP folder to save to (e.g., 'Drafts', 'INBOX.Drafts', 'Templates').",
+            description="The IMAP folder to save to (e.g., 'Templates'). Omit to use the account's \\Drafts special-use folder.",
         ),
-    ] = "Drafts",
+    ] = None,
     cc: Annotated[
         list[AddressInput] | None,
         Field(default=None, max_length=APPLICATION_LIMITS.recipients, description="A list of CC email addresses."),
@@ -710,10 +710,13 @@ async def save_to_mailbox(
         raise ValueError("Recipient(s) not in allowlist") from exc
     if outcome.status == "succeeded" and not outcome.reconciliation_needed:
         email_id = outcome.uid or "unknown"
-        return f"Email saved to '{mailbox}' successfully. Message-Id: {outcome.message_id}, email_id: {email_id}"
+        return (
+            f"Email saved to '{outcome.mailbox}' successfully. Message-Id: {outcome.message_id}, email_id: {email_id}"
+        )
     detail = f" ({outcome.detail})" if outcome.detail in _PUBLIC_APPEND_DETAILS else ""
     warning = "; warning: reconciliation needed" if outcome.reconciliation_needed else ""
-    return f"Email save [{outcome.status}{detail}: {mailbox}; Message-Id: {outcome.message_id}{warning}]"
+    target = outcome.mailbox or mailbox or r"\Drafts"
+    return f"Email save [{outcome.status}{detail}: {target}; Message-Id: {outcome.message_id}{warning}]"
 
 
 @mcp.tool(

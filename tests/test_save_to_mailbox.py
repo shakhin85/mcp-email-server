@@ -428,7 +428,7 @@ class TestClassicEmailHandlerSaveToMailbox:
         mock_append.assert_called_once_with(
             mock_compose,
             email_settings.incoming,
-            "Drafts",
+            None,
             r"(\Draft \Seen)",
         )
 

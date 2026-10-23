@@ -600,7 +600,7 @@ async def test_sent_copy_ignores_invalid_provider_derived_mailbox(email_server) 
     imap = _imap()
     with (
         patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)),
-        patch.object(client, "_find_sent_folder_by_flag", AsyncMock(return_value="Bad\r\nMailbox")),
+        patch.object(client, "_find_folder_by_flag", AsyncMock(return_value="Bad\r\nMailbox")),
     ):
         result = await client.append_to_sent_with_outcome(message, email_server)
 
@@ -946,3 +946,40 @@ async def test_legacy_send_debug_logs_are_redacted(email_server) -> None:
     assert "SMTP phase=send outcome=started" in captured
     assert "SMTP phase=send outcome=succeeded" in captured
     _assert_smtp_log_redacted(captured)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("flag_folder", "expected"),
+    [("Brouillons", "Brouillons"), (None, "Drafts"), ("Bad\r\nMailbox", "Drafts")],
+)
+async def test_append_without_mailbox_uses_drafts_special_use_folder(email_server, flag_folder, expected) -> None:
+    client = EmailClient(email_server)
+    message = client.compose_message(["recipient@example.test"], "Draft", "body")
+    imap = _imap()
+    find = AsyncMock(return_value=flag_folder)
+    with (
+        patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)),
+        patch.object(client, "_find_folder_by_flag", find),
+    ):
+        result = await client.append_to_mailbox_with_outcome(message, email_server, None)
+
+    assert (result.status, result.mailbox) == ("succeeded", expected)
+    assert imap.select.await_args.args == (f'"{expected}"',)
+    assert find.await_args.args[1] == r"\Drafts"
+
+
+@pytest.mark.asyncio
+async def test_append_with_explicit_mailbox_skips_special_use_lookup(email_server) -> None:
+    client = EmailClient(email_server)
+    message = client.compose_message(["recipient@example.test"], "Draft", "body")
+    imap = _imap()
+    find = AsyncMock(return_value="Brouillons")
+    with (
+        patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)),
+        patch.object(client, "_find_folder_by_flag", find),
+    ):
+        result = await client.append_to_mailbox_with_outcome(message, email_server, "Templates")
+
+    assert result.mailbox == "Templates"
+    find.assert_not_awaited()

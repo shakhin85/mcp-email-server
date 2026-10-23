@@ -417,7 +417,7 @@ class TestEmailClientSendEmailReturnsMessage:
 
 
 class TestFindSentFolderByFlag:
-    """Tests for _find_sent_folder_by_flag method."""
+    """Tests for _find_folder_by_flag method."""
 
     @pytest.fixture
     def email_client(self):
@@ -473,7 +473,7 @@ class TestFindSentFolderByFlag:
     @pytest.mark.asyncio
     async def test_find_sent_folder_by_flag_success(self, email_client, mock_imap_with_sent_flag):
         """Test successful detection of Sent folder via IMAP flag."""
-        result = await email_client._find_sent_folder_by_flag(mock_imap_with_sent_flag)
+        result = await email_client._find_folder_by_flag(mock_imap_with_sent_flag, r"\Sent")
 
         assert result == "Gesendete Objekte"
         mock_imap_with_sent_flag.list.assert_called_once_with('""', "*")
@@ -489,7 +489,7 @@ class TestFindSentFolderByFlag:
             )
         )
 
-        result = await email_client._find_sent_folder_by_flag(mock)
+        result = await email_client._find_folder_by_flag(mock, r"\Sent")
         assert result == "Gesendete Objekte"
 
     @pytest.mark.asyncio
@@ -503,7 +503,7 @@ class TestFindSentFolderByFlag:
             )
         )
 
-        result = await email_client._find_sent_folder_by_flag(mock)
+        result = await email_client._find_folder_by_flag(mock, r"\Sent")
         assert result == "[Gmail]/Gesendet"
 
     @pytest.mark.asyncio
@@ -517,20 +517,20 @@ class TestFindSentFolderByFlag:
             )
         )
 
-        result = await email_client._find_sent_folder_by_flag(mock)
+        result = await email_client._find_folder_by_flag(mock, r"\Sent")
         assert result == "Gesendete Übjekte"
 
     @pytest.mark.asyncio
     async def test_find_sent_folder_by_flag_not_found(self, email_client, mock_imap_without_sent_flag):
         """Test when no folder with \\Sent flag exists."""
-        result = await email_client._find_sent_folder_by_flag(mock_imap_without_sent_flag)
+        result = await email_client._find_folder_by_flag(mock_imap_without_sent_flag, r"\Sent")
 
         assert result is None
 
     @pytest.mark.asyncio
     async def test_find_sent_folder_by_flag_handles_error(self, email_client, mock_imap_list_error):
         """Test error handling when IMAP list fails."""
-        result = await email_client._find_sent_folder_by_flag(mock_imap_list_error)
+        result = await email_client._find_folder_by_flag(mock_imap_list_error, r"\Sent")
 
         assert result is None
 
@@ -545,7 +545,7 @@ class TestFindSentFolderByFlag:
             )
         )
 
-        result = await email_client._find_sent_folder_by_flag(mock)
+        result = await email_client._find_folder_by_flag(mock, r"\Sent")
         assert result == "Sent Items"
 
 

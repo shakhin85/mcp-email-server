@@ -236,12 +236,13 @@ class ComposeCommand:
 
 @dataclass(frozen=True)
 class SaveToMailboxCommand(ComposeCommand):
-    mailbox: str = "Drafts"
+    mailbox: str | None = None
     flags: tuple[str, ...] | None = None
 
     def validate(self) -> None:
         super().validate()
-        validate_mailbox_name(self.mailbox)
+        if self.mailbox is not None:
+            validate_mailbox_name(self.mailbox)
         if self.flags is not None:
             if any(not isinstance(flag, str) for flag in self.flags):
                 raise ValueError("flags must contain strings")
@@ -693,7 +694,8 @@ class SaveToMailboxService(_MutationWorkflow):
             )
         if outcome.status not in ("succeeded", "unknown"):
             return outcome
-        invalidated = await self._invalidate(access.account, (command.mailbox,))
+        mailboxes = (outcome.mailbox,) if outcome.mailbox else ()
+        invalidated = await self._invalidate(access.account, mailboxes)
         return _validate_append_result(
             AppendMutationOutcome(
                 status=outcome.status,

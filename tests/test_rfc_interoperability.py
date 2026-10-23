@@ -215,7 +215,7 @@ async def test_sent_folder_special_use_matching_is_case_insensitive(rfc_email_cl
         [b'(\\sent \\HasNoChildren) "/" "Gesendet"', b"LIST completed."],
     )
 
-    assert await rfc_email_client._find_sent_folder_by_flag(imap) == "Gesendet"
+    assert await rfc_email_client._find_folder_by_flag(imap, r"\Sent") == "Gesendet"
 
 
 def test_search_astring_encoding_preserves_user_text(rfc_email_client):
