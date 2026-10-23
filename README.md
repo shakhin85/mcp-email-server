@@ -98,6 +98,7 @@ For the SQLite-backed managed CLI workflow, Windows and POSIX storage boundaries
 headless environments, containers, multiple accounts, custom TLS settings, and
 environment-variable configuration, see the
 [documentation](https://mcp-email-server.wh1isper.top/).
+Per-account HTML paragraph style and signature are described in [Configuration](https://mcp-email-server.wh1isper.top/configuration/#html-body-style-and-signature).
 
 ## Documentation
 

@@ -29,6 +29,7 @@ from mcp_email_server.application.mutations import (
     SetEmailFlagsCommand,
 )
 from mcp_email_server.config import EmailSettings, Settings
+from mcp_email_server.emails.account_format import apply_account_format
 from mcp_email_server.emails.classic import ClassicEmailHandler, _validate_flags
 from mcp_email_server.metadata_index import MetadataIndex, MetadataIndexError
 
@@ -81,9 +82,12 @@ class ClassicMutationProvider:
         account: MutationAccountSnapshot,
     ) -> AppendMutationOutcome:
         del account
+        body, attachments = apply_account_format(
+            self._handler.email_settings, command.body, command.html, list(command.attachments) or None
+        )
         body, thread_index = await _bounded_mutation_call(
             self._handler.resolve_reply(
-                command.body,
+                body,
                 command.html,
                 command.in_reply_to,
                 command.quote_history,
@@ -96,7 +100,7 @@ class ClassicMutationProvider:
             list(command.cc) or None,
             list(command.bcc) or None,
             command.html,
-            list(command.attachments) or None,
+            attachments,
             command.in_reply_to,
             command.references,
             include_bcc_header=True,
@@ -159,9 +163,12 @@ class ClassicMutationProvider:
         client = self._handler.outgoing_client
         if client is None:
             raise MutationProviderError("capability_unavailable: SMTP is not configured for this account")
+        body, attachments = apply_account_format(
+            self._handler.email_settings, command.body, command.html, list(command.attachments) or None
+        )
         body, thread_index = await _bounded_mutation_call(
             self._handler.resolve_reply(
-                command.body,
+                body,
                 command.html,
                 command.in_reply_to,
                 command.quote_history,
@@ -175,7 +182,7 @@ class ClassicMutationProvider:
                 list(command.cc) or None,
                 list(command.bcc) or None,
                 command.html,
-                list(command.attachments) or None,
+                attachments,
                 command.in_reply_to,
                 command.references,
                 command.reply_to,

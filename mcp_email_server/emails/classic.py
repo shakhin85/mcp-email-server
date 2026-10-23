@@ -64,6 +64,7 @@ from mcp_email_server.application.mutations import (
 )
 from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
 from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails.account_format import apply_account_format
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -654,7 +655,7 @@ def _apply_mentions(  # noqa: C901
         if html:
             return (
                 '<a id="OWAAM' + mention_id + 'Z" href="mailto:' + addr + '">'
-                '<span style=\'font-family:"Calibri",sans-serif;text-decoration:none\'>'
+                "<span style='font-family:\"Calibri\",sans-serif;text-decoration:none'>"
                 "@" + escape_html(name) + "</span></a>"
             )
         return "@" + name + " (" + addr + ")"
@@ -3645,6 +3646,12 @@ class ClassicEmailHandler(EmailHandler):
             failed_ids=failed_ids,
         )
 
+    def apply_account_format(
+        self, body: str, html: bool, attachments: list[str] | None
+    ) -> tuple[str, list[str] | None]:
+        """Apply the account's HTML paragraph style, signature and signature attachments."""
+        return apply_account_format(self.email_settings, body, html, attachments)
+
     async def resolve_reply(
         self, body: str, html: bool, in_reply_to: str | None, quote_history: bool
     ) -> tuple[str, str | None]:
@@ -3682,6 +3689,7 @@ class ClassicEmailHandler(EmailHandler):
         if self.outgoing_client is None:
             raise RuntimeError(f"SMTP is not configured for account '{self.email_settings.account_name}'")
 
+        body, attachments = self.apply_account_format(body, html, attachments)
         body, thread_index = await self.resolve_reply(body, html, in_reply_to, quote_history)
 
         msg = await self.outgoing_client.send_email(
@@ -3744,6 +3752,7 @@ class ClassicEmailHandler(EmailHandler):
             ValueError: If any flag in *flags* is invalid per RFC 3501.
             RuntimeError: If the IMAP APPEND operation fails.
         """
+        body, attachments = self.apply_account_format(body, html, attachments)
         body, thread_index = await self.resolve_reply(body, html, in_reply_to, quote_history)
 
         msg = self.incoming_client.compose_message(

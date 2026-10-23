@@ -461,6 +461,16 @@ configuration marker whose corresponding write did not complete. Migration
 reports cleanup failures, but backup and recovery remain the operator's
 responsibility.
 
+## HTML signature and signature attachments
+
+`html_signature_path` and `signature_attachments` come only from the account
+configuration (TOML or environment), never from tool arguments, so an MCP
+client cannot make the server read other files through them. The server reads
+these files with the privileges of its own process; keep them in a directory
+only the account owner can write. Unreadable files fail the call before
+sending or saving. `html_paragraph_style` is HTML-escaped when written into the
+`style` attribute.
+
 ## Recipient allowlist
 
 Sending is disabled when the allowed-recipient collection is empty. Enable and

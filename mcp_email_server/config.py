@@ -296,6 +296,9 @@ class EmailSettings(AccountAttributes):
     outgoing: EmailServer | None = None
     save_to_sent: bool = True  # Save sent emails to IMAP Sent folder
     sent_folder_name: str | None = None  # Override Sent folder name (auto-detect if None)
+    html_paragraph_style: str | None = None  # Inline style for body <p> without style (html=True)
+    html_signature_path: str | None = None  # HTML signature file appended before quoted history
+    signature_attachments: list[str] = Field(default_factory=list)  # Files attached with every html message
 
     @property
     def can_send(self) -> bool:
@@ -327,6 +330,9 @@ class EmailSettings(AccountAttributes):
         smtp_password: str | None = None,
         save_to_sent: bool = True,
         sent_folder_name: str | None = None,
+        html_paragraph_style: str | None = None,
+        html_signature_path: str | None = None,
+        signature_attachments: list[str] | None = None,
     ) -> EmailSettings:
         for candidate in (password, imap_password, smtp_password):
             if candidate == keyring_store.SENTINEL:
@@ -364,6 +370,9 @@ class EmailSettings(AccountAttributes):
             ),
             save_to_sent=save_to_sent,
             sent_folder_name=sent_folder_name,
+            html_paragraph_style=html_paragraph_style,
+            html_signature_path=html_signature_path,
+            signature_attachments=signature_attachments or [],
         )
 
     @classmethod
@@ -388,6 +397,9 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_SMTP_VERIFY_SSL (default: true)
         - MCP_EMAIL_SERVER_SAVE_TO_SENT (default: true)
         - MCP_EMAIL_SERVER_SENT_FOLDER_NAME (default: auto-detect)
+        - MCP_EMAIL_SERVER_HTML_PARAGRAPH_STYLE (optional; inline style for HTML body paragraphs)
+        - MCP_EMAIL_SERVER_HTML_SIGNATURE_PATH (optional; HTML signature file)
+        - MCP_EMAIL_SERVER_SIGNATURE_ATTACHMENTS (optional; comma-separated file paths)
         """
         # Check if minimum required environment variables are set
         email_address = os.getenv("MCP_EMAIL_SERVER_EMAIL_ADDRESS")
@@ -431,6 +443,13 @@ class EmailSettings(AccountAttributes):
                 imap_password=os.getenv("MCP_EMAIL_SERVER_IMAP_PASSWORD", password),
                 save_to_sent=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SAVE_TO_SENT"), True),
                 sent_folder_name=os.getenv("MCP_EMAIL_SERVER_SENT_FOLDER_NAME"),
+                html_paragraph_style=os.getenv("MCP_EMAIL_SERVER_HTML_PARAGRAPH_STYLE") or None,
+                html_signature_path=os.getenv("MCP_EMAIL_SERVER_HTML_SIGNATURE_PATH") or None,
+                signature_attachments=[
+                    item.strip()
+                    for item in os.getenv("MCP_EMAIL_SERVER_SIGNATURE_ATTACHMENTS", "").split(",")
+                    if item.strip()
+                ],
             )
         except (ValueError, TypeError) as e:
             logger.error(f"Failed to create email settings from environment variables: {e}")

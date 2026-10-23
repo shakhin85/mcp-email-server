@@ -620,6 +620,31 @@ Set `save_to_sent = false` to disable the IMAP append after sending. The
 environment equivalents are `MCP_EMAIL_SERVER_SAVE_TO_SENT` and
 `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`.
 
+## HTML body style and signature
+
+Optional per-account fields make the server format HTML messages, so the
+formatting does not depend on the caller. They apply to `send_email` and
+`save_to_mailbox` only when `html=True`; plain-text messages and accounts
+without these fields are unchanged.
+
+```toml
+[[emails]]
+account_name = "work"
+html_paragraph_style = "margin:0;font-family:Calibri"
+html_signature_path = "/home/me/signature.html"
+signature_attachments = ["/home/me/logo.png"]
+```
+
+| TOML field                | Environment variable                      | Description                                                                                  |
+| ------------------------- | ----------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `html_paragraph_style`    | `MCP_EMAIL_SERVER_HTML_PARAGRAPH_STYLE`   | Inline `style` for every `<p>` without one. Plain text without `<p>` is split on blank lines. |
+| `html_signature_path`     | `MCP_EMAIL_SERVER_HTML_SIGNATURE_PATH`    | UTF-8 HTML file appended after the body, before quoted history.                              |
+| `signature_attachments`   | `MCP_EMAIL_SERVER_SIGNATURE_ATTACHMENTS`  | Files added to every HTML message (comma-separated in the environment). Reference an image as `cid:<file name>` in the signature to embed it. |
+
+An empty environment value means unset. A signature file that cannot be read,
+or a missing signature attachment, fails the call before sending or saving.
+A file the caller already attached (same absolute path) is not added twice.
+
 ## Outgoing message headers
 
 Every outgoing MIME message carries a single top-level `MIME-Version: 1.0`

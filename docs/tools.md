@@ -244,6 +244,7 @@ Sends a message through the selected account's SMTP server. It supports:
 - Plain-text or HTML bodies.
 - Attachments from file paths available to the server process. Relative paths use the process working directory; absolute paths are recommended.
 - `Reply-To`, `In-Reply-To`, and `References` headers.
+- With `html=True`, the account's configured paragraph style, signature, and signature attachments are applied by the server before any quoted history is added. See [HTML body style and signature](configuration.md#html-body-style-and-signature).
 
 The tool is always present in the stable MCP catalog. The selected
 `account_name` must itself be enabled and send-capable; an IMAP-only account is
@@ -279,7 +280,8 @@ as `utf8-append-unsupported` without changing the successful SMTP outcome.
 Composes a message and appends it to an IMAP mailbox instead of sending it. It
 works without SMTP and is useful for drafts or templates. It shares recipient,
 body, attachment, and threading fields with `send_email`, adds `mailbox` and
-`flags`, and does not support `reply_to`.
+`flags`, and does not support `reply_to`. With `html=True` it applies the same
+account paragraph style, signature, and signature attachments as `send_email`.
 
 The default mailbox is `Drafts`. When no explicit flags are supplied, the
 message is saved with `\Draft` and `\Seen`. The response includes the RFC
