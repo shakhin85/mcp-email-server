@@ -606,6 +606,11 @@ class TestMentionsBodyBuilding:
         assert "Hello " in new_body
         assert "! Welcome." in new_body
 
+    def test_html_mention_outlook_font(self, email_client):
+        # Outlook рисует упоминания Calibri 11pt; без размера span берёт кегль абзаца
+        _r, _c, new_body = _apply_mentions("{@bob@example.com}", True, ["alice@example.com"], None, ["bob@example.com"])
+        assert 'font-family:"Calibri",sans-serif;font-size:11.0pt' in new_body
+
     def test_html_mention_escapes_name(self, email_client):
         body = "Hey {@x@example.com}"
         _recipients, _cc, new_body = _apply_mentions(

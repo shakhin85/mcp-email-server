@@ -655,7 +655,7 @@ def _apply_mentions(  # noqa: C901
         if html:
             return (
                 '<a id="OWAAM' + mention_id + 'Z" href="mailto:' + addr + '">'
-                "<span style='font-family:\"Calibri\",sans-serif;text-decoration:none'>"
+                "<span style='font-family:\"Calibri\",sans-serif;font-size:11.0pt;text-decoration:none'>"
                 "@" + escape_html(name) + "</span></a>"
             )
         return "@" + name + " (" + addr + ")"
