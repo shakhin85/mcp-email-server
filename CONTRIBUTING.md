@@ -105,6 +105,11 @@ requires 80% coverage for changed lines. A focused diagnostic run may use
 before submission. Add tests for meaningful behavior and failure or security
 boundaries rather than percentage-only execution.
 
+While iterating, `make test-fast` skips tests marked `e2e` or `slow` (packaging
+builds and raw stdio subprocess tests) and stops at the first failure. It is
+a feedback loop only; `make test` stays the complete gate. Mark a new test
+that takes more than about one second with `@pytest.mark.slow`.
+
 Frontend changes require Node 22.12 or later. Rebuild and stage the locked React
 assets before the Python checks:
 

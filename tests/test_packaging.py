@@ -184,6 +184,7 @@ def _workflow_job_runs(path: Path, job_name: str) -> list[str]:
     return runs
 
 
+@pytest.mark.slow
 def test_distribution_is_node_free_and_embeds_reproducible_ui(tmp_path: Path) -> None:
     uv = shutil.which("uv")
     assert uv is not None
@@ -314,6 +315,7 @@ def test_distribution_is_node_free_and_embeds_reproducible_ui(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(os.name != "posix", reason="The V2 UI filesystem and PTY contract is POSIX-only")
+@pytest.mark.slow
 def test_isolated_wheel_and_local_uvx_serve_authenticated_ui(tmp_path: Path) -> None:
     uv = shutil.which("uv")
     assert uv is not None

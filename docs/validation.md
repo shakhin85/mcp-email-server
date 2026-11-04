@@ -36,6 +36,11 @@ Docker:
 make test
 ```
 
+`make test-fast` is the quick feedback loop: it additionally skips tests marked
+`slow` (packaging builds and raw stdio subprocess tests) and stops at the first
+failure. It does not replace `make test`. Every test also has a 60-second
+`pytest-timeout` limit; packaging tests raise it to 240 seconds.
+
 ## Automated coverage policy
 
 `make test` measures statement and branch coverage for `mcp_email_server`,

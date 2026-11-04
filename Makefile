@@ -36,6 +36,10 @@ test: ## Test the code with pytest
 	@echo "Testing code with pytest"
 	@uv run python -m pytest --cov --cov-config=pyproject.toml --cov-report=xml -vv -s
 
+.PHONY: test-fast
+test-fast: ## Quick feedback loop: skip e2e and slow packaging/stdio subprocess tests, stop at first failure
+	@uv run python -m pytest -m "not e2e and not slow" -q -x --tb=short
+
 .PHONY: test-e2e
 test-e2e: ## Test the stdio MCP server against local GreenMail SMTP and IMAP services
 	@echo "Testing the stdio MCP server against GreenMail"

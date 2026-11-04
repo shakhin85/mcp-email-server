@@ -127,6 +127,7 @@ async def _server(tmp_path: Path, *, probe: bool = False) -> AsyncIterator[RawSt
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_raw_stdio_initialization_catalog_stdout_purity_and_idle_eof(tmp_path: Path) -> None:
     expected = json.loads((REPOSITORY / "tests/fixtures/mcp_catalog.json").read_text(encoding="utf-8"))
     async with _server(tmp_path) as server:
@@ -197,6 +198,7 @@ async def test_bounded_reader_discards_chunked_oversized_frame_until_newline_or_
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_raw_stdio_redacts_malformed_utf8_json_and_oversized_frames_then_recovers(tmp_path: Path) -> None:
     utf8_sentinel = b"MALFORMED_UTF8_SECRET_SENTINEL"
     json_sentinel = b"MALFORMED_JSON_SECRET_SENTINEL"
@@ -229,6 +231,7 @@ async def test_raw_stdio_redacts_malformed_utf8_json_and_oversized_frames_then_r
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Broken-pipe stdio behavior is POSIX-specific")
+@pytest.mark.slow
 def test_raw_stdio_broken_stdout_does_not_wait_for_open_stdin(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text('credential_storage = "plaintext"\n', encoding="utf-8")
@@ -267,6 +270,7 @@ def test_raw_stdio_broken_stdout_does_not_wait_for_open_stdin(tmp_path: Path) ->
                 process.wait(timeout=5)
 
 
+@pytest.mark.slow
 def test_raw_stdio_accepts_regular_file_redirection_and_devnull_eof(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text('credential_storage = "plaintext"\n', encoding="utf-8")
@@ -307,6 +311,7 @@ def test_raw_stdio_accepts_regular_file_redirection_and_devnull_eof(tmp_path: Pa
     assert response["result"]["protocolVersion"] == "2025-06-18"
 
 
+@pytest.mark.slow
 def test_plugin_stdio_startup_failure_is_bounded_without_traceback(tmp_path: Path) -> None:
     app_dir = tmp_path / "plugin-startup"
     app_dir.mkdir(mode=0o700)
@@ -355,6 +360,7 @@ async def _wait_for_path(path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_raw_stdio_cancellation_reaches_tool_and_session_remains_usable(tmp_path: Path) -> None:
     async with _server(tmp_path, probe=True) as server:
         await server.initialize()
@@ -385,6 +391,7 @@ async def test_raw_stdio_cancellation_reaches_tool_and_session_remains_usable(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_raw_stdio_eof_cancels_inflight_tool_and_cleans_runtime(tmp_path: Path) -> None:
     async with _server(tmp_path, probe=True) as server:
         await server.initialize()
