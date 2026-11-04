@@ -2,8 +2,9 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
+import aioimaplib
 import pytest
 
 from mcp_email_server.emails.classic import EmailClient
@@ -17,7 +18,7 @@ def email_client(email_server):  # email_server comes from conftest.py
 def _make_mock_imap(**overrides):
     """AsyncMock IMAP client with sensible mutation defaults."""
     capabilities = overrides.pop("capabilities", ("IMAP4rev1", "UIDPLUS"))
-    mock = AsyncMock()
+    mock = create_autospec(aioimaplib.IMAP4_SSL, instance=True)
     mock._client_task = asyncio.Future()
     mock._client_task.set_result(None)
     mock.wait_hello_from_server = AsyncMock()
