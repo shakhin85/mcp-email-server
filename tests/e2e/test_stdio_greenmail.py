@@ -872,7 +872,11 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
                     "references": references,
                 },
             )
-            assert send_result["result"] == f"Email sent successfully to {BOB[0]} with 1 attachment(s)"
+            # The parent was never delivered to this mailbox, so the reply must say so.
+            assert send_result["result"] == (
+                f"Email sent successfully to {BOB[0]} with 1 attachment(s); "
+                "warning: reply parent not found, no quoted history or Thread-Index"
+            )
 
             delivered = _wait_for_message(BOB, "INBOX", sent_subject)
             assert sent_body in (delivered.message.get_body(preferencelist=("plain",)).get_content())
