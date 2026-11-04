@@ -22,6 +22,9 @@ from types import ModuleType
 import pytest
 import yaml
 
+# Cold `uv build` plus an isolated install; a hang must fail instead of blocking CI.
+pytestmark = pytest.mark.timeout(240)
+
 pty: ModuleType | None
 try:
     import pty
@@ -30,6 +33,7 @@ except ImportError:  # pragma: no cover - collected only by non-POSIX test runne
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 STATIC_PREFIX = "mcp_email_server/web_ui/static/"
+SUBPROCESS_TIMEOUT_SECONDS = 120
 _LAUNCH_URL = re.compile(r"http://127\.0\.0\.1:\d+/manage-[A-Za-z0-9_-]+/#bootstrap=[A-Za-z0-9_-]+")
 
 
@@ -190,6 +194,7 @@ def test_distribution_is_node_free_and_embeds_reproducible_ui(tmp_path: Path) ->
             [uv, "build", "--out-dir", str(distributions)],
             cwd=REPOSITORY,
             check=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
             capture_output=True,
             text=True,
         )
@@ -289,6 +294,7 @@ def test_distribution_is_node_free_and_embeds_reproducible_ui(tmp_path: Path) ->
         cwd=source,
         env=environment,
         check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
         capture_output=True,
         text=True,
     )
@@ -297,6 +303,7 @@ def test_distribution_is_node_free_and_embeds_reproducible_ui(tmp_path: Path) ->
         cwd=source,
         env=environment,
         check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
         capture_output=True,
         text=True,
     )
@@ -317,6 +324,7 @@ def test_isolated_wheel_and_local_uvx_serve_authenticated_ui(tmp_path: Path) -> 
             [uv, "build", "--out-dir", str(distributions)],
             cwd=REPOSITORY,
             check=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
             capture_output=True,
             text=True,
         )
@@ -341,6 +349,7 @@ def test_isolated_wheel_and_local_uvx_serve_authenticated_ui(tmp_path: Path) -> 
         cwd=source,
         env=rebuild_environment,
         check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
         capture_output=True,
         text=True,
     )
@@ -350,6 +359,7 @@ def test_isolated_wheel_and_local_uvx_serve_authenticated_ui(tmp_path: Path) -> 
     subprocess.run(  # noqa: S603 - controlled test command
         [uv, "venv", "--python", sys.executable, str(environment)],
         check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
         capture_output=True,
         text=True,
     )
@@ -358,6 +368,7 @@ def test_isolated_wheel_and_local_uvx_serve_authenticated_ui(tmp_path: Path) -> 
     subprocess.run(  # noqa: S603 - controlled test command
         [uv, "pip", "install", "--python", str(python), str(wheel)],
         check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
         capture_output=True,
         text=True,
     )
