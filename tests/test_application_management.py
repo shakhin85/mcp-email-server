@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, call, create_autospec
 
 import pytest
 from pydantic import SecretStr
@@ -22,7 +22,9 @@ from mcp_email_server.application.management import (
     LegacyImportService,
     LegacySourceSnapshot,
     ManagedAccountService,
+    ManagedCatalogPort,
     ManagedPolicy,
+    ManagementBackend,
     ManagementError,
     ManagementServices,
     PolicyManagementService,
@@ -40,6 +42,14 @@ def _endpoint(host: str = "imap.example.test") -> EmailServer:
         password=SecretStr("not-persisted"),
         use_ssl=True,
     )
+
+
+def _backend() -> ManagementBackend:
+    return create_autospec(ManagementBackend, instance=True)
+
+
+def _catalog(**attrs: object) -> ManagedCatalogPort:
+    return create_autospec(ManagedCatalogPort, instance=True, **attrs)
 
 
 def _summary(host: str = "imap.example.test") -> EndpointSummary:
@@ -75,10 +85,10 @@ def _details(*, outgoing: EndpointSummary | None = None) -> AccountDetails:
 
 def test_catalog_initialization_selects_managed_and_records_database() -> None:
     database = Path.cwd() / "private" / "catalog.sqlite3"
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=None)
     backend.load_legacy_source.return_value = _empty_legacy_source()
-    catalog = Mock(path=database)
+    catalog = _catalog(path=database)
     catalog.catalog_revision.return_value = 1
     backend.initialize_catalog.return_value = catalog
     service = CatalogService(backend)
@@ -98,7 +108,7 @@ def test_catalog_initialization_selects_managed_and_records_database() -> None:
 
 def test_catalog_initialization_preserves_legacy_until_existing_settings_are_imported() -> None:
     database = Path("/private/catalog.sqlite3")
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="legacy",
         db_path=None,
@@ -107,7 +117,7 @@ def test_catalog_initialization_preserves_legacy_until_existing_settings_are_imp
         running_db_path=None,
     )
     backend.load_legacy_source.return_value = _legacy_source()
-    catalog = Mock(path=database)
+    catalog = _catalog(path=database)
     catalog.catalog_revision.return_value = 1
     backend.initialize_catalog.return_value = catalog
 
@@ -123,13 +133,13 @@ def test_catalog_initialization_preserves_legacy_until_existing_settings_are_imp
 
 def test_catalog_initialization_can_retry_after_bootstrap_cas_loss() -> None:
     database = Path.cwd() / "private" / "catalog.sqlite3"
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.side_effect = [
         BootstrapSnapshot(mode="legacy", db_path=None, revision=3),
         BootstrapSnapshot(mode="legacy", db_path=Path.cwd() / "private" / "other.sqlite3", revision=4),
     ]
     backend.load_legacy_source.return_value = _empty_legacy_source()
-    catalog = Mock(path=database)
+    catalog = _catalog(path=database)
     backend.initialize_catalog.return_value = catalog
     backend.write_selection.side_effect = [RevisionConflictError("bootstrap"), None]
     service = CatalogService(backend)
@@ -147,9 +157,9 @@ def test_catalog_initialization_can_retry_after_bootstrap_cas_loss() -> None:
 
 def test_managed_selection_validates_effective_catalog_before_write() -> None:
     database = Path("/private/catalog.sqlite3")
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=database)
-    catalog = Mock()
+    catalog = _catalog()
     catalog.catalog_revision.return_value = 7
     backend.open_catalog.return_value = catalog
 
@@ -163,13 +173,13 @@ def test_managed_selection_validates_effective_catalog_before_write() -> None:
     assert result.bootstrap_revision == 1
     assert result.restart_required is True
     catalog.validate_ready.assert_called_once_with()
-    catalog.load_settings.assert_not_called()
+    catalog.load_account.assert_not_called()
     backend.write_selection.assert_called_once_with("managed", database, expected_revision=0)
 
 
 def test_bound_account_mutation_rejects_selection_drift_even_when_revisions_match() -> None:
-    backend = Mock()
-    catalog_a = Mock()
+    backend = _backend()
+    catalog_a = _catalog()
     path_a = Path("/private/a.sqlite3")
     path_b = Path("/private/b.sqlite3")
     backend.read_bootstrap.side_effect = [
@@ -186,13 +196,13 @@ def test_bound_account_mutation_rejects_selection_drift_even_when_revisions_matc
         accounts.enable("alice", expected_revision=1)
 
     backend.open_catalog.assert_called_once_with(path_a)
-    catalog_a.set_account_enabled.assert_not_called()
+    catalog_a.enable_account.assert_not_called()
 
 
 def test_account_creation_uses_one_service_for_rows_and_both_candidates() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
-    catalog = Mock()
+    catalog = _catalog()
     backend.open_catalog.return_value = catalog
     command = CreateAccountCommand(
         expected_catalog_revision=3,
@@ -234,9 +244,9 @@ def test_account_creation_command_excludes_secrets_from_repr_and_equality() -> N
 
 
 def test_account_update_merges_endpoint_patch_before_catalog_write() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
-    catalog = Mock()
+    catalog = _catalog()
     catalog.show_account.return_value = _details()
     catalog.update_account.return_value = 5
     backend.open_catalog.return_value = catalog
@@ -262,9 +272,9 @@ def test_account_update_merges_endpoint_patch_before_catalog_write() -> None:
 
 
 def test_new_outgoing_endpoint_requires_complete_patch() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
-    catalog = Mock()
+    catalog = _catalog()
     catalog.show_account.return_value = _details()
     backend.open_catalog.return_value = catalog
 
@@ -281,9 +291,9 @@ def test_new_outgoing_endpoint_requires_complete_patch() -> None:
 
 
 def test_soft_remove_requires_exact_transport_independent_confirmation() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
-    catalog = Mock()
+    catalog = _catalog()
     backend.open_catalog.return_value = catalog
     service = ManagedAccountService(backend)
 
@@ -294,7 +304,7 @@ def test_soft_remove_requires_exact_transport_independent_confirmation() -> None
 
 
 def test_legacy_preview_never_resolves_credentials() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
     backend.load_legacy_source.return_value = LegacySourceSnapshot(
         accounts=(
@@ -316,7 +326,7 @@ def test_legacy_preview_never_resolves_credentials() -> None:
         allowed_senders=(),
         report_blocked_mutations=False,
     )
-    catalog = Mock()
+    catalog = _catalog()
     catalog.list_accounts.return_value = []
     catalog.has_removed_account.return_value = False
     catalog.policy.return_value = ManagedPolicy(
@@ -361,10 +371,10 @@ def test_repeated_exact_legacy_apply_verifies_secret_and_performs_guarded_cutove
         allowed_senders=(),
         report_blocked_mutations=False,
     )
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
     backend.load_legacy_source.return_value = source
-    catalog = Mock()
+    catalog = _catalog()
     catalog.list_accounts.return_value = [
         AccountSummary(
             name="alice",
@@ -445,7 +455,7 @@ def test_repeated_exact_legacy_apply_verifies_secret_and_performs_guarded_cutove
 
 
 def test_legacy_apply_rejects_all_conflicts_before_secret_resolution() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
     backend.load_legacy_source.return_value = LegacySourceSnapshot(
         accounts=(
@@ -467,7 +477,7 @@ def test_legacy_apply_rejects_all_conflicts_before_secret_resolution() -> None:
         allowed_senders=(),
         report_blocked_mutations=False,
     )
-    catalog = Mock()
+    catalog = _catalog()
     catalog.list_accounts.return_value = [AccountSummary("alice", "alice@example.test", True, 2, False, "ACTIVE", None)]
     catalog.show_account.return_value = _details()
     catalog.policy.return_value = ManagedPolicy(1, False, (), (), False)
@@ -488,10 +498,10 @@ def test_legacy_apply_rejects_all_conflicts_before_secret_resolution() -> None:
 
 
 def test_legacy_apply_rejects_target_revision_drift_after_secret_resolution() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
     backend.load_legacy_source.return_value = _legacy_source()
-    catalog = Mock()
+    catalog = _catalog()
     catalog.catalog_revision.return_value = 5
     catalog.list_accounts.return_value = [
         AccountSummary("alice", "alice@example.test", True, 4, False, "MISSING", None)
@@ -519,11 +529,11 @@ def test_legacy_apply_rejects_target_revision_drift_after_secret_resolution() ->
 
 
 def test_legacy_apply_rechecks_selected_path_after_secret_resolution() -> None:
-    backend = Mock()
+    backend = _backend()
     selected = Path("/private/a.sqlite3")
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=selected, revision=2, exists=True)
     backend.load_legacy_source.return_value = _legacy_source()
-    catalog = Mock()
+    catalog = _catalog()
     catalog.catalog_revision.return_value = 5
     catalog.list_accounts.return_value = [
         AccountSummary("alice", "alice@example.test", True, 4, False, "MISSING", None)
@@ -564,7 +574,7 @@ def test_legacy_apply_rechecks_selected_path_immediately_before_policy_write() -
         allowed_senders=(),
         report_blocked_mutations=False,
     )
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="legacy",
         db_path=selected,
@@ -586,7 +596,7 @@ def test_legacy_apply_rechecks_selected_path_immediately_before_policy_write() -
         return source
 
     backend.load_legacy_source.side_effect = load_source_and_switch_selection
-    catalog = Mock()
+    catalog = _catalog()
     catalog.catalog_revision.return_value = 1
     catalog.list_accounts.return_value = []
     catalog.policy.return_value = ManagedPolicy(1, False, (), (), False)
@@ -607,9 +617,9 @@ def test_legacy_apply_rechecks_selected_path_immediately_before_policy_write() -
 
 @pytest.mark.asyncio
 async def test_connectivity_service_delegates_to_provider_adapter() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
-    catalog = Mock()
+    catalog = _catalog()
     backend.open_catalog.return_value = catalog
     backend.test_connection = AsyncMock()
     services = ManagementServices.compose(backend)
@@ -623,9 +633,9 @@ async def test_connectivity_service_delegates_to_provider_adapter() -> None:
 
 @pytest.mark.asyncio
 async def test_outgoing_connectivity_success_reports_envelope_sender_check() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=Path("catalog.sqlite3"))
-    catalog = Mock()
+    catalog = _catalog()
     backend.open_catalog.return_value = catalog
     backend.test_connection = AsyncMock()
     services = ManagementServices.compose(backend)
@@ -660,14 +670,14 @@ def _legacy_source(*, full_name: str = "Alice") -> LegacySourceSnapshot:
     )
 
 
-def _import_backend() -> tuple[Mock, Mock]:
-    backend = Mock()
+def _import_backend() -> tuple[ManagementBackend, ManagedCatalogPort]:
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="legacy",
         db_path=Path("catalog.sqlite3"),
     )
     backend.load_legacy_source.return_value = _legacy_source()
-    catalog = Mock()
+    catalog = _catalog()
     catalog.catalog_revision.return_value = 5
     catalog.list_accounts.return_value = []
     catalog.has_removed_account.return_value = False
@@ -700,7 +710,7 @@ def test_import_with_unsupported_provider_keeps_legacy_selected() -> None:
 
 def test_status_reports_durable_selection_restart_drift() -> None:
     database = Path("/private/catalog.sqlite3")
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="managed",
         db_path=database,
@@ -723,7 +733,7 @@ def test_status_reports_durable_selection_restart_drift() -> None:
 
 def test_status_reports_unavailable_catalog_without_blocking_recovery() -> None:
     database = Path("/private/missing.sqlite3")
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="managed",
         db_path=database,
@@ -742,7 +752,7 @@ def test_status_reports_unavailable_catalog_without_blocking_recovery() -> None:
 
 def test_selecting_legacy_uses_bootstrap_revision_without_opening_failed_catalog() -> None:
     database = Path("/private/catalog.sqlite3")
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="managed", db_path=database, revision=4)
 
     CatalogService(backend).select("legacy", expected_bootstrap_revision=4)
@@ -752,7 +762,7 @@ def test_selecting_legacy_uses_bootstrap_revision_without_opening_failed_catalog
 
 
 def test_selection_rejects_stale_bootstrap_revision_before_catalog_access() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="managed",
         db_path=Path("/private/catalog.sqlite3"),
@@ -794,12 +804,12 @@ def test_legacy_apply_rejects_preview_drift_or_expiry_before_writes(drift: str) 
 
 @pytest.mark.asyncio
 async def test_connectivity_failure_is_typed_and_sanitized() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="legacy",
         db_path=Path("catalog.sqlite3"),
     )
-    backend.open_catalog.return_value = Mock()
+    backend.open_catalog.return_value = _catalog()
     backend.test_connection = AsyncMock(side_effect=ManagementError("provider host secret detail"))
 
     result = await ManagementServices.compose(backend).connectivity.execute("alice", "outgoing")
@@ -813,12 +823,12 @@ async def test_connectivity_failure_is_typed_and_sanitized() -> None:
 
 @pytest.mark.parametrize(("entry_count", "accepted"), [(1_000, True), (1_001, False)])
 def test_managed_policy_update_enforces_policy_entry_limit(entry_count: int, accepted: bool) -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="legacy",
         db_path=Path("catalog.sqlite3"),
     )
-    catalog = Mock()
+    catalog = _catalog()
     catalog.update_policy.return_value = 2
     backend.open_catalog.return_value = catalog
     policy = ManagedPolicy(
@@ -840,12 +850,12 @@ def test_managed_policy_update_enforces_policy_entry_limit(entry_count: int, acc
 
 
 def test_managed_policy_update_uses_legacy_canonicalization() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="legacy",
         db_path=Path("catalog.sqlite3"),
     )
-    catalog = Mock()
+    catalog = _catalog()
     catalog.update_policy.return_value = 8
     backend.open_catalog.return_value = catalog
 
@@ -871,12 +881,12 @@ def test_managed_policy_update_uses_legacy_canonicalization() -> None:
 
 
 def test_index_health_service_delegates_bounded_adapter_result() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="legacy",
         db_path=Path("catalog.sqlite3"),
     )
-    catalog = Mock()
+    catalog = _catalog()
     backend.open_catalog.return_value = catalog
     expected = IndexHealth("degraded", 2, 1, ("refresh_pending",))
     backend.index_health.return_value = expected
@@ -888,7 +898,7 @@ def test_index_health_service_delegates_bounded_adapter_result() -> None:
 
 
 def test_legacy_compatibility_freezes_and_preflights_only_managed_running_authority() -> None:
-    backend = Mock()
+    backend = _backend()
     service = ManagementServices.compose(backend).legacy_compatibility
     backend.freeze_runtime_authority.return_value = "legacy"
 
@@ -906,7 +916,7 @@ def test_legacy_compatibility_freezes_and_preflights_only_managed_running_author
 
 @pytest.mark.parametrize("operation", ["reset", "migrate"])
 def test_legacy_compatibility_rejects_writes_in_managed_runtime(operation: str) -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(
         mode="legacy",
         db_path=Path("catalog.sqlite3"),
@@ -925,7 +935,7 @@ def test_legacy_compatibility_rejects_writes_in_managed_runtime(operation: str) 
 
 
 def test_legacy_compatibility_delegates_migration_and_returns_bounded_report() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=None)
     expected = LegacyCredentialMigrationResult(2, ("alice:incoming",), (), "mcp-email-server")
     backend.migrate_legacy_credentials.return_value = expected
@@ -938,11 +948,11 @@ def test_legacy_compatibility_delegates_migration_and_returns_bounded_report() -
 
 def test_default_initialization_uses_backend_path_and_bootstrap_revision() -> None:
     database = Path("/private/managed.sqlite3")
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=None, revision=4, exists=True)
     backend.load_legacy_source.return_value = _empty_legacy_source()
     backend.default_catalog_path.return_value = database
-    backend.initialize_catalog.return_value = Mock(path=database)
+    backend.initialize_catalog.return_value = _catalog(path=database)
 
     result = CatalogService(backend).initialize_default(expected_bootstrap_revision=4)
 
@@ -962,11 +972,11 @@ def test_default_initialization_uses_backend_path_and_bootstrap_revision() -> No
 
 def test_default_initialization_reads_catalog_revision_before_committing_selection() -> None:
     database = Path("/private/managed.sqlite3")
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=None, revision=4, exists=True)
     backend.load_legacy_source.return_value = _empty_legacy_source()
     backend.default_catalog_path.return_value = database
-    catalog = Mock(path=database)
+    catalog = _catalog(path=database)
     selection_committed = False
 
     def read_catalog_revision() -> int:
@@ -991,11 +1001,11 @@ def test_default_initialization_reads_catalog_revision_before_committing_selecti
 
 def test_automatic_default_initialization_binds_absent_bootstrap_proof() -> None:
     database = Path("/private/managed.sqlite3")
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=None, revision=0, exists=False)
     backend.default_catalog_path.return_value = database
     backend.load_legacy_source.return_value = _empty_legacy_source()
-    backend.initialize_catalog.return_value = Mock(path=database)
+    backend.initialize_catalog.return_value = _catalog(path=database)
 
     CatalogService(backend).initialize_default(
         expected_bootstrap_revision=0,
@@ -1012,7 +1022,7 @@ def test_automatic_default_initialization_binds_absent_bootstrap_proof() -> None
 
 
 def test_automatic_default_initialization_rejects_new_effective_legacy_content() -> None:
-    backend = Mock()
+    backend = _backend()
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=None, revision=0, exists=False)
     backend.load_legacy_source.return_value = _legacy_source()
 
@@ -1029,7 +1039,7 @@ def test_automatic_default_initialization_rejects_new_effective_legacy_content()
 
 def test_default_initialization_is_idempotent_only_for_the_selected_default() -> None:
     database = Path("/private/managed.sqlite3")
-    backend = Mock()
+    backend = _backend()
     backend.default_catalog_path.return_value = database
     backend.read_bootstrap.return_value = BootstrapSnapshot(mode="legacy", db_path=database, revision=2, exists=True)
     backend.load_legacy_source.return_value = _empty_legacy_source()

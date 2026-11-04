@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,7 +41,61 @@ def _imap() -> AsyncMock:
     imap = AsyncMock()
     imap.login.return_value = MagicMock(result="OK", lines=[])
     imap.logout.return_value = ("BYE", [])
+    handshake = asyncio.get_running_loop().create_future()
+    handshake.set_result(None)
+    imap._client_task = handshake
     return imap
+
+
+def _connect(client: EmailClient, imap: AsyncMock) -> None:
+    """Route the client's connection factory to a scripted server (real greeting/prepare path)."""
+    client.imap_class = lambda *args, **kwargs: imap
+
+
+def _raw_headers(subject: str, sender: str = "sender@example.test") -> bytes:
+    return (
+        f"From: {sender}\r\nTo: user@example.test\r\nSubject: {subject}\r\n"
+        "Date: Tue, 22 Jul 2026 04:00:00 +0000\r\n\r\n"
+    ).encode()
+
+
+def _fetching_server(
+    *,
+    dates: dict[str, str] | None = None,
+    stray_dates: dict[str, str] | None = None,
+    headers: dict[str, tuple[str, list[str]]] | None = None,
+    senders: dict[str, str] | None = None,
+):
+    """UID FETCH responder that answers with real IMAP wire shapes for the UIDs requested."""
+
+    async def uid(command: str, uid_list: str, item: str):
+        assert command == "fetch"
+        requested = uid_list.split(",")
+        lines: list[object] = []
+        if "INTERNALDATE" in item:
+            for u, value in {
+                **{k: v for k, v in (dates or {}).items() if k in requested},
+                **(stray_dates or {}),
+            }.items():
+                lines.append(f'{u} FETCH (UID {u} INTERNALDATE "{value}")'.encode())
+        elif "HEADER.FIELDS" in item:
+            for u in requested:
+                if u in (senders or {}):
+                    lines.append(f"{u} FETCH (UID {u} BODY[HEADER.FIELDS (FROM)] {{40}}".encode())
+                    lines += [bytearray(f"From: {senders[u]}\r\n\r\n".encode()), b")"]
+        else:
+            for u in requested:
+                if u in (headers or {}):
+                    subject, flags = headers[u]
+                    flag_part = f"FLAGS ({' '.join(flags)}) " if "FLAGS" in item else ""
+                    lines.append(f"{u} FETCH (UID {u} {flag_part}BODY[HEADER] {{120}}".encode())
+                    lines += [bytearray(_raw_headers(subject)), b")"]
+        return "OK", lines
+
+    return uid
+
+
+INTERNAL_DATE = "22-Jul-2026 04:00:00 +0000"
 
 
 def test_mailbox_status_requires_uidvalidity_uidnext_and_message_count() -> None:
@@ -59,33 +114,26 @@ async def test_snapshot_is_complete_only_for_exact_bounded_epoch_and_uses_peek_h
     imap.status.return_value = ("OK", [b"INBOX (UIDVALIDITY 77 UIDNEXT 4 MESSAGES 3)"])
     imap.select.return_value = ("OK", [b"3"])
     imap.uid_search.return_value = ("OK", [b"1 2 3"])
-    metadata = {
-        str(uid): {
-            "email_id": str(uid),
-            "message_id": f"<{uid}@example.test>",
-            "subject": f"Subject {uid}",
-            "from": "sender@example.test",
-            "to": ["user@example.test"],
-            "date": NOW,
-            "attachments": [],
-            "_flags": ["\\Seen"] if uid == 3 else [],
-        }
-        for uid in range(1, 4)
-    }
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock(return_value={str(uid): NOW for uid in range(1, 4)})),
-        patch.object(client, "_batch_fetch_headers", AsyncMock(return_value=metadata)) as headers,
-    ):
-        snapshot = await client.get_mailbox_metadata_snapshot("INBOX")
+    imap.uid.side_effect = _fetching_server(
+        dates={str(uid): INTERNAL_DATE for uid in range(1, 4)},
+        headers={str(uid): (f"Subject {uid}", ["\\Seen"] if uid == 3 else []) for uid in range(1, 4)},
+    )
+    _connect(client, imap)
+
+    snapshot = await client.get_mailbox_metadata_snapshot("INBOX")
 
     assert snapshot.complete is True
     assert snapshot.state == MailboxState(77, 4, 3)
     assert snapshot.mailbox.name == "INBOX"
     assert snapshot.mailbox.delimiter == "/"
     assert [email["email_id"] for email in snapshot.emails] == ["3", "2", "1"]
+    assert [email["subject"] for email in snapshot.emails] == ["Subject 3", "Subject 2", "Subject 1"]
     assert snapshot.emails[0]["_internal_date"] == NOW
-    headers.assert_awaited_once_with(imap, ["3", "2", "1"], include_flags=True)
+    assert snapshot.emails[0]["_flags"] == ["\\Seen"]
+    assert snapshot.emails[1]["_flags"] == []
+    header_fetches = [c.args for c in imap.uid.await_args_list if "HEADER" in c.args[2]]
+    assert [uid_list for _, uid_list, _ in header_fetches] == ["3,2,1"]
+    assert all("BODY.PEEK[HEADER]" in item and "BODY[HEADER]" not in item for _, _, item in header_fetches)
     assert imap.status.await_count == 2
 
 
@@ -100,23 +148,10 @@ async def test_snapshot_state_change_cannot_claim_complete_coverage() -> None:
     ]
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = ("OK", [b"2"])
-    metadata = {
-        "2": {
-            "email_id": "2",
-            "subject": "Replacement",
-            "from": "sender@example.test",
-            "to": [],
-            "date": NOW,
-            "attachments": [],
-            "_flags": [],
-        }
-    }
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock(return_value={"2": NOW})),
-        patch.object(client, "_batch_fetch_headers", AsyncMock(return_value=metadata)),
-    ):
-        snapshot = await client.get_mailbox_metadata_snapshot()
+    imap.uid.side_effect = _fetching_server(dates={"2": INTERNAL_DATE}, headers={"2": ("Replacement", [])})
+    _connect(client, imap)
+
+    snapshot = await client.get_mailbox_metadata_snapshot()
 
     assert snapshot.complete is False
     assert snapshot.state == MailboxState(77, 3, 1)
@@ -134,23 +169,10 @@ async def test_snapshot_discards_rows_when_uidvalidity_changes_during_refresh() 
     ]
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = ("OK", [b"1"])
-    metadata = {
-        "1": {
-            "email_id": "1",
-            "subject": "Old epoch",
-            "from": "sender@example.test",
-            "to": [],
-            "date": NOW,
-            "attachments": [],
-            "_flags": [],
-        }
-    }
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock(return_value={"1": NOW})),
-        patch.object(client, "_batch_fetch_headers", AsyncMock(return_value=metadata)),
-    ):
-        snapshot = await client.get_mailbox_metadata_snapshot()
+    imap.uid.side_effect = _fetching_server(dates={"1": INTERNAL_DATE}, headers={"1": ("Old epoch", [])})
+    _connect(client, imap)
+
+    snapshot = await client.get_mailbox_metadata_snapshot()
 
     assert snapshot.complete is False
     assert snapshot.state == MailboxState(78, 2, 1)
@@ -307,9 +329,9 @@ async def test_provider_fallback_rejects_failed_search_instead_of_false_empty(st
     imap = _imap()
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = (status, [b"provider detail must not be exposed"])
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
-        with pytest.raises(RuntimeError, match="SEARCH mailbox INBOX failed") as exc_info:
-            await client.get_emails_metadata()
+    _connect(client, imap)
+    with pytest.raises(RuntimeError, match="SEARCH mailbox INBOX failed") as exc_info:
+        await client.get_emails_metadata()
     assert "provider detail" not in str(exc_info.value)
 
 
@@ -321,9 +343,9 @@ async def test_snapshot_search_failure_is_not_interpreted_as_empty_coverage() ->
     imap.status.return_value = ("OK", [b"INBOX (UIDVALIDITY 77 UIDNEXT 2 MESSAGES 1)"])
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = ("NO", [])
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
-        with pytest.raises(RuntimeError, match="SEARCH mailbox INBOX failed"):
-            await client.get_mailbox_metadata_snapshot()
+    _connect(client, imap)
+    with pytest.raises(RuntimeError, match="SEARCH mailbox INBOX failed"):
+        await client.get_mailbox_metadata_snapshot()
 
 
 @pytest.mark.asyncio
@@ -332,74 +354,46 @@ async def test_provider_fallback_rejects_incomplete_sender_allowlist_evidence() 
     imap = _imap()
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = ("OK", [b"1 2"])
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_senders", AsyncMock(return_value={"1": "allowed@example.test"})),
-        patch.object(client, "_batch_fetch_dates", AsyncMock()) as dates,
-    ):
-        with pytest.raises(RuntimeError, match="incomplete sender metadata"):
-            await client.get_emails_metadata(allowed_senders=["allowed@example.test"])
-    dates.assert_not_awaited()
+    imap.uid.side_effect = _fetching_server(
+        senders={"1": "allowed@example.test"},
+        dates={"1": INTERNAL_DATE, "2": INTERNAL_DATE},
+    )
+    _connect(client, imap)
+    with pytest.raises(RuntimeError, match="incomplete sender metadata"):
+        await client.get_emails_metadata(allowed_senders=["allowed@example.test"])
+    assert all("INTERNALDATE" not in c.args[2] for c in imap.uid.await_args_list)
 
 
 @pytest.mark.asyncio
-async def test_snapshot_missing_internaldate_cannot_claim_complete_coverage() -> None:
+async def test_snapshot_rejects_missing_internaldate_instead_of_claiming_coverage() -> None:
     client = _client()
     imap = _imap()
     imap.list.return_value = ("OK", [])
     imap.status.return_value = ("OK", [b"INBOX (UIDVALIDITY 77 UIDNEXT 2 MESSAGES 1)"])
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = ("OK", [b"1"])
-    metadata = {
-        "1": {
-            "email_id": "1",
-            "subject": "No date evidence",
-            "from": "sender@example.test",
-            "to": [],
-            "date": NOW,
-            "attachments": [],
-            "_flags": [],
-        }
-    }
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock(return_value={})),
-        patch.object(client, "_batch_fetch_headers", AsyncMock(return_value=metadata)),
-    ):
-        snapshot = await client.get_mailbox_metadata_snapshot()
+    imap.uid.side_effect = _fetching_server(dates={}, headers={"1": ("No date evidence", [])})
+    _connect(client, imap)
 
-    assert snapshot.complete is False
-    assert snapshot.emails[0]["_internal_date"] is None
+    with pytest.raises(MetadataProviderObservationError, match="incomplete INTERNALDATE"):
+        await client.get_mailbox_metadata_snapshot()
 
 
 @pytest.mark.asyncio
-async def test_snapshot_same_count_wrong_internaldate_uid_set_cannot_claim_complete_coverage() -> None:
+async def test_snapshot_rejects_wrong_internaldate_uid_set_instead_of_claiming_coverage() -> None:
     client = _client()
     imap = _imap()
     imap.list.return_value = ("OK", [])
     imap.status.return_value = ("OK", [b"INBOX (UIDVALIDITY 77 UIDNEXT 2 MESSAGES 1)"])
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = ("OK", [b"1"])
-    metadata = {
-        "1": {
-            "email_id": "1",
-            "subject": "Wrong date evidence",
-            "from": "sender@example.test",
-            "to": [],
-            "date": NOW,
-            "attachments": [],
-            "_flags": [],
-        }
-    }
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock(return_value={"999": NOW})),
-        patch.object(client, "_batch_fetch_headers", AsyncMock(return_value=metadata)),
-    ):
-        snapshot = await client.get_mailbox_metadata_snapshot()
+    imap.uid.side_effect = _fetching_server(
+        stray_dates={"999": INTERNAL_DATE}, headers={"1": ("Wrong date evidence", [])}
+    )
+    _connect(client, imap)
 
-    assert snapshot.complete is False
-    assert snapshot.emails[0]["_internal_date"] is None
+    with pytest.raises(MetadataProviderObservationError, match="invalid INTERNALDATE"):
+        await client.get_mailbox_metadata_snapshot()
 
 
 @pytest.mark.asyncio
@@ -414,16 +408,11 @@ async def test_provider_fallback_rejects_noncanonical_search_uids_before_fetch_w
     imap = _imap()
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = ("OK", [search_payload])
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock()) as dates,
-        patch.object(client, "_batch_fetch_headers", AsyncMock()) as headers,
-    ):
-        with pytest.raises(MetadataProviderObservationError, match="invalid UID search results"):
-            await client.get_emails_metadata()
+    _connect(client, imap)
+    with pytest.raises(MetadataProviderObservationError, match="invalid UID search results"):
+        await client.get_emails_metadata()
 
-    dates.assert_not_awaited()
-    headers.assert_not_awaited()
+    imap.uid.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -432,15 +421,16 @@ async def test_provider_fallback_rejects_same_count_wrong_internaldate_uid_set()
     imap = _imap()
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = ("OK", [b"1 2"])
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock(return_value={"1": NOW, "999": NOW})),
-        patch.object(client, "_batch_fetch_headers", AsyncMock()) as headers,
-    ):
-        with pytest.raises(MetadataProviderObservationError, match="incomplete INTERNALDATE"):
-            await client.get_emails_metadata()
+    imap.uid.side_effect = _fetching_server(
+        dates={"1": INTERNAL_DATE},
+        stray_dates={"999": INTERNAL_DATE},
+        headers={"1": ("One", []), "2": ("Two", [])},
+    )
+    _connect(client, imap)
+    with pytest.raises(MetadataProviderObservationError, match="INTERNALDATE"):
+        await client.get_emails_metadata()
 
-    headers.assert_not_awaited()
+    assert all("HEADER" not in c.args[2] for c in imap.uid.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -465,16 +455,11 @@ async def test_provider_fallback_rejects_more_than_candidate_ceiling_before_fetc
         "OK",
         [b" ".join(str(uid).encode() for uid in range(1, MAX_METADATA_CANDIDATES + 2))],
     )
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock()) as dates,
-        patch.object(client, "_batch_fetch_headers", AsyncMock()) as headers,
-    ):
-        with pytest.raises(MetadataQueryTooBroadError, match="query_too_broad"):
-            await client.get_emails_metadata()
+    _connect(client, imap)
+    with pytest.raises(MetadataQueryTooBroadError, match="query_too_broad"):
+        await client.get_emails_metadata()
 
-    dates.assert_not_awaited()
-    headers.assert_not_awaited()
+    imap.uid.assert_not_awaited()
     imap.logout.assert_awaited_once()
 
 
@@ -484,13 +469,10 @@ async def test_provider_fallback_rejects_incomplete_page_instead_of_returning_sh
     imap = _imap()
     imap.select.return_value = ("OK", [])
     imap.uid_search.return_value = ("OK", [b"1"])
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock(return_value={"1": NOW})),
-        patch.object(client, "_batch_fetch_headers", AsyncMock(return_value={})),
-    ):
-        with pytest.raises(RuntimeError, match="incomplete metadata page"):
-            await client.get_emails_metadata()
+    imap.uid.side_effect = _fetching_server(dates={"1": INTERNAL_DATE}, headers={})
+    _connect(client, imap)
+    with pytest.raises(RuntimeError, match="incomplete metadata page"):
+        await client.get_emails_metadata()
 
 
 @pytest.mark.asyncio
@@ -509,24 +491,13 @@ async def test_snapshot_larger_than_recent_window_is_partial_without_absence_del
         [b" ".join(str(uid).encode() for uid in range(1, count + 1))],
     )
     selected = [str(uid) for uid in range(count, 1, -1)]
-    metadata = {
-        uid: {
-            "email_id": uid,
-            "subject": uid,
-            "from": "sender@example.test",
-            "to": [],
-            "date": NOW,
-            "attachments": [],
-            "_flags": [],
-        }
-        for uid in selected
-    }
-    with (
-        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
-        patch.object(client, "_batch_fetch_dates", AsyncMock(return_value=dict.fromkeys(selected, NOW))),
-        patch.object(client, "_batch_fetch_headers", AsyncMock(return_value=metadata)),
-    ):
-        snapshot = await client.get_mailbox_metadata_snapshot("INBOX")
+    imap.uid.side_effect = _fetching_server(
+        dates=dict.fromkeys(selected, INTERNAL_DATE),
+        headers={uid: (f"Subject {uid}", []) for uid in selected},
+    )
+    _connect(client, imap)
+
+    snapshot = await client.get_mailbox_metadata_snapshot("INBOX")
 
     assert snapshot.complete is False
     assert len(snapshot.emails) == MAX_INDEXED_UID_WINDOW
