@@ -682,3 +682,38 @@ async def test_sent_copy_timeout_preserves_delivery_and_is_unknown(monkeypatch) 
     assert result.reconciliation_needed is True
     provider.send.assert_awaited_once()
     provider.save_sent_copy.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_save_keeps_missing_parent_mark_through_projection_invalidation() -> None:
+    provider = MagicMock()
+    provider.save_to_mailbox = AsyncMock(
+        return_value=AppendMutationOutcome("succeeded", "<id>", uid="5", mailbox="Drafts", parent_missing=True)
+    )
+    services, _, _, _ = _services(provider=provider)
+
+    result = await services.save_to_mailbox.execute(
+        SaveToMailboxCommand("primary", ("to@example.test",), "Subject", "body")
+    )
+
+    assert result.parent_missing is True
+
+
+@pytest.mark.asyncio
+async def test_send_keeps_missing_parent_mark_when_sent_copy_saved_and_when_it_fails() -> None:
+    provider = MagicMock()
+    provider.send = AsyncMock(
+        return_value=DeliveryMutationOutcome(
+            (TargetMutationOutcome("to@example.test", "succeeded"),),
+            object(),
+            parent_missing=True,
+        )
+    )
+    provider.save_sent_copy = AsyncMock(return_value=SentCopyMutationOutcome("succeeded", "Sent"))
+    services, _, _, _ = _services(provider=provider)
+    command = SendCommand(account_name="primary", recipients=("to@example.test",), subject="Subject", body="body")
+
+    assert (await services.send.execute(command)).parent_missing is True
+
+    provider.save_sent_copy = AsyncMock(side_effect=RuntimeError("append failed"))
+    assert (await services.send.execute(command)).parent_missing is True

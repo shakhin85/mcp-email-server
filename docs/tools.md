@@ -476,4 +476,11 @@ To preserve conversation threading:
    original `message_id`, omitting missing values.
 4. Send the reply with a suitable `Re:` subject.
 
+The server looks for the parent in `INBOX`, the configured sent folder, `Sent Items`,
+and the mailbox with the `\\Sent` special-use attribute, then quotes its history and
+reuses its `Thread-Index`. When no mailbox holds the parent, `send_email` and
+`save_to_mailbox` still complete and their result carries
+`warning: reply parent not found`: that message has no quoted history and starts a
+new Outlook conversation.
+
 For a complete example, see [Reply with proper threading](guides.md#reply-with-proper-threading).

@@ -15,6 +15,7 @@ from mcp_email_server.application.mutations import (
     SetEmailFlagsCommand,
 )
 from mcp_email_server.config import EmailSettings
+from mcp_email_server.emails.classic import ResolvedReply
 
 
 def _set_flags_provider(error: BaseException) -> ClassicMutationProvider:
@@ -91,7 +92,7 @@ async def test_mutation_adapter_composes_and_appends_mailbox_message(
     outcome = AppendMutationOutcome("succeeded", "message-id", mailbox="Drafts")
     handler = MagicMock()
     handler.email_settings = email_settings
-    handler.resolve_reply = AsyncMock(return_value=("Body", None))
+    handler.resolve_reply = AsyncMock(return_value=ResolvedReply("Body", None))
     handler.incoming_client.compose_message = Mock(return_value=message)
     handler.incoming_client.append_to_mailbox_with_outcome = AsyncMock(return_value=outcome)
     provider = ClassicMutationProvider(handler)
@@ -207,7 +208,7 @@ async def test_mutation_adapter_threads_and_quotes_reply(email_settings: EmailSe
     outcome = AppendMutationOutcome("succeeded", "message-id", mailbox="Drafts")
     handler = MagicMock()
     handler.email_settings = email_settings
-    handler.resolve_reply = AsyncMock(return_value=("Body\n\nquoted parent", "AdX0parentIndex=="))
+    handler.resolve_reply = AsyncMock(return_value=ResolvedReply("Body\n\nquoted parent", "AdX0parentIndex=="))
     handler.incoming_client.compose_message = Mock(return_value=message)
     handler.incoming_client.append_to_mailbox_with_outcome = AsyncMock(return_value=outcome)
     provider = ClassicMutationProvider(handler)

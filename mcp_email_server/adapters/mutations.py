@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -85,7 +85,7 @@ class ClassicMutationProvider:
         body, attachments = apply_account_format(
             self._handler.email_settings, command.body, command.html, list(command.attachments) or None
         )
-        body, thread_index = await _bounded_mutation_call(
+        reply = await _bounded_mutation_call(
             self._handler.resolve_reply(
                 body,
                 command.html,
@@ -96,7 +96,7 @@ class ClassicMutationProvider:
         message = self._handler.incoming_client.compose_message(
             list(command.recipients),
             command.subject,
-            body,
+            reply.body,
             list(command.cc) or None,
             list(command.bcc) or None,
             command.html,
@@ -104,11 +104,11 @@ class ClassicMutationProvider:
             command.in_reply_to,
             command.references,
             include_bcc_header=True,
-            thread_index=thread_index,
+            thread_index=reply.thread_index,
             mentions=list(command.mentions) if command.mentions else None,
         )
         flags = r"(\Draft \Seen)" if command.flags is None else _validate_flags(list(command.flags))
-        return await _bounded_mutation_call(
+        outcome = await _bounded_mutation_call(
             self._handler.incoming_client.append_to_mailbox_with_outcome(
                 message,
                 self._handler.email_settings.incoming,
@@ -116,6 +116,7 @@ class ClassicMutationProvider:
                 flags,
             )
         )
+        return replace(outcome, parent_missing=True) if reply.parent_missing else outcome
 
     async def delete(
         self,
@@ -166,7 +167,7 @@ class ClassicMutationProvider:
         body, attachments = apply_account_format(
             self._handler.email_settings, command.body, command.html, list(command.attachments) or None
         )
-        body, thread_index = await _bounded_mutation_call(
+        reply = await _bounded_mutation_call(
             self._handler.resolve_reply(
                 body,
                 command.html,
@@ -174,11 +175,11 @@ class ClassicMutationProvider:
                 command.quote_history,
             )
         )
-        return await _bounded_mutation_call(
+        outcome = await _bounded_mutation_call(
             client.send_email_with_outcome(
                 list(command.recipients),
                 command.subject,
-                body,
+                reply.body,
                 list(command.cc) or None,
                 list(command.bcc) or None,
                 command.html,
@@ -186,10 +187,11 @@ class ClassicMutationProvider:
                 command.in_reply_to,
                 command.references,
                 command.reply_to,
-                thread_index=thread_index,
+                thread_index=reply.thread_index,
                 mentions=list(command.mentions) if command.mentions else None,
             )
         )
+        return replace(outcome, parent_missing=True) if reply.parent_missing else outcome
 
     async def save_sent_copy(
         self,

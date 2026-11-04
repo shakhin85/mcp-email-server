@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol, TypeVar
 
@@ -92,6 +92,7 @@ class AppendMutationOutcome:
     mailbox: str | None = None
     detail: str | None = None
     reconciliation_needed: bool = False
+    parent_missing: bool = False
 
     def __post_init__(self) -> None:
         if self.status == "unknown" and not self.reconciliation_needed:
@@ -102,6 +103,7 @@ class AppendMutationOutcome:
 class DeliveryMutationOutcome:
     outcomes: tuple[TargetMutationOutcome, ...]
     sent_message: object | None
+    parent_missing: bool = False
 
     @property
     def has_accepted_recipient(self) -> bool:
@@ -120,6 +122,7 @@ class SendMutationOutcome:
     delivery: tuple[TargetMutationOutcome, ...]
     sent_copy: SentCopyMutationOutcome
     reconciliation_needed: bool = False
+    parent_missing: bool = False
 
     def __post_init__(self) -> None:
         ambiguous = any(item.status == "unknown" for item in self.delivery) or self.sent_copy.status == "unknown"
@@ -704,6 +707,7 @@ class SaveToMailboxService(_MutationWorkflow):
                 mailbox=outcome.mailbox,
                 detail=outcome.detail,
                 reconciliation_needed=outcome.reconciliation_needed or not invalidated,
+                parent_missing=outcome.parent_missing,
             )
         )
 
@@ -823,8 +827,22 @@ class SendService(_MutationWorkflow):
                 )
             )
         if not delivery.has_accepted_recipient or delivery.sent_message is None:
-            return _validate_send_result(SendMutationOutcome(delivery.outcomes, SentCopyMutationOutcome("skipped")))
+            return _validate_send_result(
+                SendMutationOutcome(
+                    delivery.outcomes,
+                    SentCopyMutationOutcome("skipped"),
+                    parent_missing=delivery.parent_missing,
+                )
+            )
+        outcome = await self._save_sent_copy(command, account, delivery)
+        return replace(outcome, parent_missing=delivery.parent_missing)
 
+    async def _save_sent_copy(
+        self,
+        command: SendCommand,
+        account: MutationAccountSnapshot,
+        delivery: DeliveryMutationOutcome,
+    ) -> SendMutationOutcome:
         # Saving the copy is a separate provider effect and therefore gets a fresh
         # lifecycle/credential resolution. SMTP delivery is never rewritten.
         try:

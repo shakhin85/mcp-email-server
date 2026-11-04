@@ -29,7 +29,7 @@ from email.policy import default
 from html import escape as escape_html
 from itertools import pairwise
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import aioimaplib
 import aiosmtplib
@@ -2335,19 +2335,32 @@ class EmailClient:
             msg.attach(part)
         return msg
 
+    async def _parent_mailboxes(self, imap, mailboxes: tuple[str, ...], *, utf8: bool) -> tuple[str, ...]:
+        """Add the \\Sent special-use folder: its name is localized, so a fixed
+        list misses a parent the user sent from a non-English mailbox."""
+        sent_folder = await self._find_folder_by_flag(imap, r"\Sent", utf8=utf8)
+        if sent_folder is None:
+            return mailboxes
+        try:
+            validate_mailbox_name(sent_folder)
+        except ValueError:
+            logger.debug("Ignoring invalid provider-derived Sent mailbox")
+            return mailboxes
+        return tuple(dict.fromkeys((*mailboxes, sent_folder)))
+
     async def _lookup_parent(
         self, message_id: str, mailboxes: tuple[str, ...] = ("INBOX", "Sent Items", "Sent")
     ) -> dict[str, str] | None:
         """Fetch the parent message by Message-ID: its Thread-Index (so a reply
         joins the same Outlook conversation) plus the headers and bodies needed
         to quote the history. Best-effort: any failure → None (the reply starts
-        a new conversation and carries no quote)."""
+        a new conversation and carries no quote; resolve_reply marks it missing)."""
         try:
             imap = await self._connect_imap()
             try:
                 await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
                 utf8 = "UTF8=ACCEPT" in _imap_capabilities(imap)
-                for mailbox in mailboxes:
+                for mailbox in await self._parent_mailboxes(imap, mailboxes, utf8=utf8):
                     select_response = await imap.select(_quote_mailbox(mailbox, utf8=utf8))
                     if _imap_status(select_response) != "OK":
                         continue
@@ -3537,6 +3550,12 @@ class EmailClient:
         return mailboxes
 
 
+class ResolvedReply(NamedTuple):
+    body: str
+    thread_index: str | None
+    parent_missing: bool = False
+
+
 class ClassicEmailHandler(EmailHandler):
     def __init__(self, email_settings: EmailSettings):
         self.email_settings = email_settings
@@ -3669,24 +3688,24 @@ class ClassicEmailHandler(EmailHandler):
         """Apply the account's HTML paragraph style, signature and signature attachments."""
         return apply_account_format(self.email_settings, body, html, attachments)
 
-    async def resolve_reply(
-        self, body: str, html: bool, in_reply_to: str | None, quote_history: bool
-    ) -> tuple[str, str | None]:
+    async def resolve_reply(self, body: str, html: bool, in_reply_to: str | None, quote_history: bool) -> ResolvedReply:
         """For replies: fetch the parent from the mailbox (IMAP — hence the
         incoming client; the outgoing one only knows the SMTP server) and return
-        (body with the quoted history appended, parent's Thread-Index).
-        Non-replies and unresolvable parents pass the body through unchanged."""
+        the body with the quoted history appended plus the parent's Thread-Index.
+        Non-replies and unresolvable parents pass the body through unchanged;
+        an unresolvable parent is marked so the tool result can warn about it."""
         if not in_reply_to:
-            return body, None
+            return ResolvedReply(body, None)
         parent = await self.incoming_client._lookup_parent(
             in_reply_to,
             mailboxes=tuple(m for m in ("INBOX", self.sent_folder_name, "Sent Items") if m),
         )
         if not parent:
-            return body, None
+            logger.warning(f"Reply parent not found: {in_reply_to}")
+            return ResolvedReply(body, None, parent_missing=True)
         if quote_history:
             body = _quote_history_html(body, parent) if html else _quote_history_plain(body, parent)
-        return body, parent.get("thread_index") or None
+        return ResolvedReply(body, parent.get("thread_index") or None)
 
     async def send_email(
         self,
@@ -3707,7 +3726,7 @@ class ClassicEmailHandler(EmailHandler):
             raise RuntimeError(f"SMTP is not configured for account '{self.email_settings.account_name}'")
 
         body, attachments = self.apply_account_format(body, html, attachments)
-        body, thread_index = await self.resolve_reply(body, html, in_reply_to, quote_history)
+        body, thread_index, _ = await self.resolve_reply(body, html, in_reply_to, quote_history)
 
         msg = await self.outgoing_client.send_email(
             recipients,
@@ -3770,7 +3789,7 @@ class ClassicEmailHandler(EmailHandler):
             RuntimeError: If the IMAP APPEND operation fails.
         """
         body, attachments = self.apply_account_format(body, html, attachments)
-        body, thread_index = await self.resolve_reply(body, html, in_reply_to, quote_history)
+        body, thread_index, _ = await self.resolve_reply(body, html, in_reply_to, quote_history)
 
         msg = self.incoming_client.compose_message(
             recipients,

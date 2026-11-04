@@ -166,6 +166,9 @@ def _tagged_batch_result(outcome: BatchMutationOutcome) -> str:
     return "; ".join(sections)
 
 
+_PARENT_MISSING_WARNING = "warning: reply parent not found, no quoted history or Thread-Index"
+
+
 def _tagged_send_result(outcome: SendMutationOutcome) -> str:
     sections = _ordered_target_sections(
         outcome.delivery,
@@ -184,6 +187,8 @@ def _tagged_send_result(outcome: SendMutationOutcome) -> str:
     sections.append(f"sent-copy: {sent_copy}")
     if outcome.reconciliation_needed:
         sections.append("warning: reconciliation needed")
+    if outcome.parent_missing:
+        sections.append(_PARENT_MISSING_WARNING)
     return "; ".join(sections)
 
 
@@ -588,7 +593,8 @@ async def send_email(
     ):
         recipient_str = ", ".join(recipients)
         attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
-        return f"Email sent successfully to {recipient_str}{attachment_info}"
+        warning = f"; {_PARENT_MISSING_WARNING}" if outcome.parent_missing else ""
+        return f"Email sent successfully to {recipient_str}{attachment_info}{warning}"
     return f"Email delivery [{_tagged_send_result(outcome)}]"
 
 
@@ -708,13 +714,15 @@ async def save_to_mailbox(
         )
     except RecipientPolicyDeniedError as exc:
         raise ValueError("Recipient(s) not in allowlist") from exc
+    parent_warning = f"; {_PARENT_MISSING_WARNING}" if outcome.parent_missing else ""
     if outcome.status == "succeeded" and not outcome.reconciliation_needed:
         email_id = outcome.uid or "unknown"
         return (
-            f"Email saved to '{outcome.mailbox}' successfully. Message-Id: {outcome.message_id}, email_id: {email_id}"
+            f"Email saved to '{outcome.mailbox}' successfully. "
+            f"Message-Id: {outcome.message_id}, email_id: {email_id}{parent_warning}"
         )
     detail = f" ({outcome.detail})" if outcome.detail in _PUBLIC_APPEND_DETAILS else ""
-    warning = "; warning: reconciliation needed" if outcome.reconciliation_needed else ""
+    warning = ("; warning: reconciliation needed" if outcome.reconciliation_needed else "") + parent_warning
     target = outcome.mailbox or mailbox or r"\Drafts"
     return f"Email save [{outcome.status}{detail}: {target}; Message-Id: {outcome.message_id}{warning}]"
 
