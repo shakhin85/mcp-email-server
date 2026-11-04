@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import tomllib
 import urllib.parse
 import urllib.request
 import zipfile
@@ -413,64 +414,86 @@ def test_isolated_wheel_and_local_uvx_serve_authenticated_ui(tmp_path: Path) -> 
         _stop_ui(release_process, release_terminal)
 
 
-def test_ci_and_release_use_the_same_exact_artifact_verification_path() -> None:
-    main = REPOSITORY / ".github/workflows/main.yml"
-    release = REPOSITORY / ".github/workflows/on-release-main.yml"
+MAIN_WORKFLOW = REPOSITORY / ".github/workflows/main.yml"
+RELEASE_WORKFLOW = REPOSITORY / ".github/workflows/on-release-main.yml"
+RELEASE_GATE_JOBS = ("verify-release-source", "release-python-matrix", "release-validation-and-build")
 
-    assert _workflow_job_runs(main, "documentation") == ["make docs-test"]
-    assert _workflow_job_runs(main, "artifacts") == ["make build", "make verify-dist"]
 
-    supported = ["3.11", "3.12", "3.13", "3.14"]
-    main_matrix = _workflow_job(main, "tests-and-type-check")
-    release_matrix = _workflow_job(release, "release-python-matrix")
+def _supported_pythons() -> list[str]:
+    classifiers = tomllib.loads((REPOSITORY / "pyproject.toml").read_text(encoding="utf-8"))["project"]["classifiers"]
+    prefix = "Programming Language :: Python :: 3."
+    versions = [f"3.{value.removeprefix(prefix)}" for value in classifiers if value.startswith(prefix)]
+    assert versions
+    return versions
+
+
+def _checkout_step(path: Path, job_name: str) -> dict[str, object]:
+    steps = _workflow_steps(path, job_name)
+    return next(step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@"))
+
+
+def _checkout_options(path: Path, job_name: str) -> dict[str, object]:
+    options = _checkout_step(path, job_name)["with"]
+    assert isinstance(options, dict)
+    return options
+
+
+def test_ci_builds_and_verifies_the_same_artifacts_it_documents() -> None:
+    assert _workflow_job_runs(MAIN_WORKFLOW, "documentation") == ["make docs-test"]
+    assert _workflow_job_runs(MAIN_WORKFLOW, "artifacts") == ["make build", "make verify-dist"]
+
+
+def test_ci_and_release_test_every_classifier_python_with_the_same_command() -> None:
+    supported = _supported_pythons()
+    main_matrix = _workflow_job(MAIN_WORKFLOW, "tests-and-type-check")
+    release_matrix = _workflow_job(RELEASE_WORKFLOW, "release-python-matrix")
     assert main_matrix["strategy"]["matrix"]["python-version"] == supported  # type: ignore[index]
     assert release_matrix["strategy"]["matrix"]["python-version"] == supported  # type: ignore[index]
-    assert _workflow_job_runs(main, "tests-and-type-check")[0] in _workflow_job_runs(release, "release-python-matrix")
+    main_runs = _workflow_job_runs(MAIN_WORKFLOW, "tests-and-type-check")
+    assert main_runs[0] in _workflow_job_runs(RELEASE_WORKFLOW, "release-python-matrix")
 
-    validation_runs = _workflow_job_runs(release, "release-validation-and-build")
+
+def test_release_builds_before_verifying_and_publishes_only_verified_dist() -> None:
+    validation_runs = _workflow_job_runs(RELEASE_WORKFLOW, "release-validation-and-build")
     assert validation_runs.index("make build") < validation_runs.index("make verify-dist")
-    publish_runs = _workflow_job_runs(release, "publish")
-    assert publish_runs == ["sha256sum --check dist.sha256", "uv publish dist/*"]
-    publish = _workflow_job(release, "publish")
-    assert set(publish["needs"]) == {  # type: ignore[arg-type]
-        "verify-release-source",
-        "release-python-matrix",
-        "release-validation-and-build",
-    }
-    workflow = yaml.safe_load(release.read_text(encoding="utf-8"))
+    assert _workflow_job_runs(RELEASE_WORKFLOW, "publish") == ["sha256sum --check dist.sha256", "uv publish dist/*"]
+    publish = _workflow_job(RELEASE_WORKFLOW, "publish")
+    assert set(publish["needs"]) == set(RELEASE_GATE_JOBS)  # type: ignore[arg-type]
+
+
+def test_release_grants_write_permission_only_to_publish() -> None:
+    workflow = yaml.safe_load(RELEASE_WORKFLOW.read_text(encoding="utf-8"))
     assert workflow["permissions"] == {"contents": "read"}
-    assert publish["permissions"] == {"contents": "write"}
-    for job_name in ("verify-release-source", "release-python-matrix", "release-validation-and-build"):
-        assert _workflow_job(release, job_name).get("permissions", {"contents": "read"}) != {"contents": "write"}
+    assert _workflow_job(RELEASE_WORKFLOW, "publish")["permissions"] == {"contents": "write"}
+    for job_name in RELEASE_GATE_JOBS:
+        job = _workflow_job(RELEASE_WORKFLOW, job_name)
+        assert job.get("permissions", {"contents": "read"}) != {"contents": "write"}
 
-    source_steps = _workflow_steps(release, "verify-release-source")
-    source_checkout = next(step for step in source_steps if step.get("uses") == "actions/checkout@v6")
-    checkout_options = source_checkout["with"]
-    assert isinstance(checkout_options, dict)
-    assert checkout_options == {"ref": "${{ github.sha }}", "fetch-depth": 0}
-    source_check = next(step for step in source_steps if step.get("name") == "Verify exact release tag commit")
-    source_command = source_check["run"]
-    assert isinstance(source_command, str)
-    assert "refs/tags/${RELEASE_TAG}^{commit}" in source_command
-    assert 'test "$tag_sha" = "$EVENT_SHA"' in source_command
-    assert 'release_version="$(python3 dev/set_release_version.py "$RELEASE_TAG")"' in source_command
-    assert 'test "$RELEASE_TAG" = "$release_version" || test "$RELEASE_TAG" = "v${release_version}"' in source_command
-    assert 'echo "release_version=$release_version" >> "$GITHUB_OUTPUT"' in source_command
 
+def test_release_source_job_requires_tag_to_match_event_commit_and_version() -> None:
+    options = _checkout_options(RELEASE_WORKFLOW, "verify-release-source")
+    assert options == {"ref": "${{ github.sha }}", "fetch-depth": 0}
+    steps = _workflow_steps(RELEASE_WORKFLOW, "verify-release-source")
+    source_check = next(step for step in steps if step.get("name") == "Verify exact release tag commit")
+    command = source_check["run"]
+    assert isinstance(command, str)
+    assert "refs/tags/${RELEASE_TAG}^{commit}" in command
+    assert 'test "$tag_sha" = "$EVENT_SHA"' in command
+    assert 'release_version="$(python3 dev/set_release_version.py "$RELEASE_TAG")"' in command
+    assert 'test "$RELEASE_TAG" = "$release_version" || test "$RELEASE_TAG" = "v${release_version}"' in command
+    assert 'echo "release_version=$release_version" >> "$GITHUB_OUTPUT"' in command
+
+
+def test_release_jobs_build_the_verified_commit_with_the_verified_version() -> None:
     expected_ref = "${{ needs.verify-release-source.outputs.release_sha }}"
     stamp_command = 'python3 dev/set_release_version.py "${{ needs.verify-release-source.outputs.release_version }}"'
-    for job_name in ("release-python-matrix", "release-validation-and-build"):
-        steps = _workflow_steps(release, job_name)
-        checkout = next(step for step in steps if step.get("uses") == "actions/checkout@v6")
-        options = checkout["with"]
-        assert isinstance(options, dict)
-        assert options["ref"] == expected_ref
-        assert stamp_command in _workflow_job_runs(release, job_name)
-
+    for job_name in RELEASE_GATE_JOBS[1:]:
+        assert _checkout_options(RELEASE_WORKFLOW, job_name)["ref"] == expected_ref
+        assert stamp_command in _workflow_job_runs(RELEASE_WORKFLOW, job_name)
     release_commands = [
         command
-        for job_name in ("verify-release-source", "release-python-matrix", "release-validation-and-build", "publish")
-        for command in _workflow_job_runs(release, job_name)
+        for job_name in (*RELEASE_GATE_JOBS, "publish")
+        for command in _workflow_job_runs(RELEASE_WORKFLOW, job_name)
     ]
-    assert sum("set_release_version" in command for command in release_commands) == 3
+    assert sum("set_release_version" in command for command in release_commands) == len(RELEASE_GATE_JOBS)
     assert "uv lock" not in release_commands
