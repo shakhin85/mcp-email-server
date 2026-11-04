@@ -4,8 +4,10 @@ import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import create_autospec, patch
 
+import aioimaplib
+import aiosmtplib
 import pytest
 
 from mcp_email_server.adapters.mutations import ClassicMutationProvider
@@ -21,10 +23,15 @@ from mcp_email_server.application.mutations import (
     MarkReadCommand,
     MoveCommand,
     MutableEmailFlag,
+    MutationAccountAuthority,
     MutationAccountSnapshot,
+    MutationProjection,
     MutationProjectionError,
+    MutationProjectionFactory,
+    MutationProvider,
     MutationProviderAccess,
     MutationProviderError,
+    MutationProviderFactory,
     MutationServices,
     SaveToMailboxCommand,
     SendCommand,
@@ -54,20 +61,18 @@ def _batch(*outcomes: TargetMutationOutcome) -> BatchMutationOutcome:
 def _services(
     *,
     account: MutationAccountSnapshot | None = None,
-    provider: MagicMock | None = None,
-    projection: MagicMock | None = None,
-) -> tuple[MutationServices, MagicMock, MagicMock, MagicMock]:
+    provider: MutationProvider | None = None,
+    projection: MutationProjection | None = None,
+) -> tuple[MutationServices, MutationAccountAuthority, MutationProviderFactory, MutationProjection]:
     current = account if account is not None else _account()
-    authority = MagicMock()
+    authority = create_autospec(MutationAccountAuthority, instance=True)
     authority.resolve.return_value = current
-    selected_provider = provider if provider is not None else MagicMock()
-    factory = MagicMock()
+    selected_provider = provider if provider is not None else create_autospec(MutationProvider, instance=True)
+    factory = create_autospec(MutationProviderFactory, instance=True)
     factory.open.return_value = MutationProviderAccess(current, selected_provider)
-    selected_projection = projection if projection is not None else MagicMock()
-    if projection is None:
-        selected_projection.invalidate = AsyncMock()
-    projections = MagicMock()
-    projections.open = AsyncMock(return_value=selected_projection)
+    selected_projection = projection if projection is not None else create_autospec(MutationProjection, instance=True)
+    projections = create_autospec(MutationProjectionFactory, instance=True)
+    projections.open.return_value = selected_projection
     return (
         MutationServices.compose(authority, factory, projections),
         authority,
@@ -140,12 +145,10 @@ def test_unknown_outcome_models_always_require_reconciliation() -> None:
 
 @pytest.mark.asyncio
 async def test_mark_read_unknown_is_not_replayed_and_invalidates_projection() -> None:
-    provider = MagicMock()
-    provider.set_flags = AsyncMock(
-        return_value=_batch(
-            TargetMutationOutcome("9", "succeeded"),
-            TargetMutationOutcome("10", "unknown", "store"),
-        )
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.set_flags.return_value = _batch(
+        TargetMutationOutcome("9", "succeeded"),
+        TargetMutationOutcome("10", "unknown", "store"),
     )
     services, _, factory, projection = _services(provider=provider)
 
@@ -164,10 +167,10 @@ async def test_mark_read_unknown_is_not_replayed_and_invalidates_projection() ->
 
 @pytest.mark.asyncio
 async def test_known_provider_success_survives_projection_failure_with_warning() -> None:
-    provider = MagicMock()
-    provider.delete = AsyncMock(return_value=_batch(TargetMutationOutcome("7", "succeeded")))
-    projection = MagicMock()
-    projection.invalidate = AsyncMock(side_effect=MutationProjectionError("unavailable"))
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.delete.return_value = _batch(TargetMutationOutcome("7", "succeeded"))
+    projection = create_autospec(MutationProjection, instance=True)
+    projection.invalidate.side_effect = MutationProjectionError("unavailable")
     services, _, _, _ = _services(provider=provider, projection=projection)
 
     result = await services.delete.execute(DeleteCommand("primary", ("7",)))
@@ -178,10 +181,10 @@ async def test_known_provider_success_survives_projection_failure_with_warning()
 
 @pytest.mark.asyncio
 async def test_projection_cancellation_does_not_erase_known_provider_success() -> None:
-    provider = MagicMock()
-    provider.delete = AsyncMock(return_value=_batch(TargetMutationOutcome("7", "succeeded")))
-    projection = MagicMock()
-    projection.invalidate = AsyncMock(side_effect=asyncio.CancelledError())
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.delete.return_value = _batch(TargetMutationOutcome("7", "succeeded"))
+    projection = create_autospec(MutationProjection, instance=True)
+    projection.invalidate.side_effect = asyncio.CancelledError()
     services, _, _, _ = _services(provider=provider, projection=projection)
 
     result = await services.delete.execute(DeleteCommand("primary", ("7",)))
@@ -192,8 +195,8 @@ async def test_projection_cancellation_does_not_erase_known_provider_success() -
 
 @pytest.mark.asyncio
 async def test_known_failure_does_not_invalidate_projection() -> None:
-    provider = MagicMock()
-    provider.delete = AsyncMock(return_value=_batch(TargetMutationOutcome("7", "failed", "uidplus-unavailable")))
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.delete.return_value = _batch(TargetMutationOutcome("7", "failed", "uidplus-unavailable"))
     services, _, _, projection = _services(provider=provider)
 
     result = await services.delete.execute(DeleteCommand("primary", ("7",)))
@@ -204,9 +207,9 @@ async def test_known_failure_does_not_invalidate_projection() -> None:
 
 @pytest.mark.asyncio
 async def test_save_unknown_is_returned_once_and_marks_mailbox_stale() -> None:
-    provider = MagicMock()
-    provider.save_to_mailbox = AsyncMock(
-        return_value=AppendMutationOutcome("unknown", "<draft@example.test>", mailbox="Drafts", detail="append")
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.save_to_mailbox.return_value = AppendMutationOutcome(
+        "unknown", "<draft@example.test>", mailbox="Drafts", detail="append"
     )
     services, _, factory, projection = _services(provider=provider)
 
@@ -228,9 +231,9 @@ async def test_save_unknown_is_returned_once_and_marks_mailbox_stale() -> None:
 
 @pytest.mark.asyncio
 async def test_archive_reopens_authority_between_discovery_and_move() -> None:
-    provider = MagicMock()
-    provider.find_archive_mailbox = AsyncMock(return_value="Archive")
-    provider.move = AsyncMock(return_value=_batch(TargetMutationOutcome("11", "succeeded")))
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.find_archive_mailbox.return_value = "Archive"
+    provider.move.return_value = _batch(TargetMutationOutcome("11", "succeeded"))
     services, _, factory, projection = _services(provider=provider)
 
     result = await services.archive.execute(ArchiveCommand("primary", ("11",)))
@@ -243,18 +246,16 @@ async def test_archive_reopens_authority_between_discovery_and_move() -> None:
 
 @pytest.mark.asyncio
 async def test_send_preserves_partial_delivery_and_separate_sent_copy() -> None:
-    provider = MagicMock()
+    provider = create_autospec(MutationProvider, instance=True)
     sent_message = object()
-    provider.send = AsyncMock(
-        return_value=DeliveryMutationOutcome(
-            (
-                TargetMutationOutcome("accepted@example.test", "succeeded"),
-                TargetMutationOutcome("rejected@example.test", "failed", "smtp-rejected"),
-            ),
-            sent_message,
-        )
+    provider.send.return_value = DeliveryMutationOutcome(
+        (
+            TargetMutationOutcome("accepted@example.test", "succeeded"),
+            TargetMutationOutcome("rejected@example.test", "failed", "smtp-rejected"),
+        ),
+        sent_message,
     )
-    provider.save_sent_copy = AsyncMock(return_value=SentCopyMutationOutcome("unknown", "Sent", "append"))
+    provider.save_sent_copy.return_value = SentCopyMutationOutcome("unknown", "Sent", "append")
     services, _, factory, projection = _services(provider=provider)
 
     result = await services.send.execute(
@@ -285,23 +286,22 @@ async def test_production_send_path_hides_bcc_from_smtp_and_adds_it_only_to_fres
     sent_provider = ClassicMutationProvider(sent_handler)
     account = _account()
 
-    authority = MagicMock()
+    authority = create_autospec(MutationAccountAuthority, instance=True)
     authority.resolve.return_value = account
-    factory = MagicMock()
+    factory = create_autospec(MutationProviderFactory, instance=True)
     factory.open.side_effect = [
         MutationProviderAccess(account, first_provider),
         MutationProviderAccess(account, sent_provider),
     ]
-    projection = MagicMock()
-    projection.invalidate = AsyncMock()
-    projections = MagicMock()
-    projections.open = AsyncMock(return_value=projection)
+    projection = create_autospec(MutationProjection, instance=True)
+    projections = create_autospec(MutationProjectionFactory, instance=True)
+    projections.open.return_value = projection
     services = MutationServices.compose(authority, factory, projections)
 
-    smtp = AsyncMock()
+    smtp = create_autospec(aiosmtplib.SMTP, instance=True)
     smtp.__aenter__.return_value = smtp
     smtp.__aexit__.return_value = False
-    smtp.supports_extension = MagicMock(return_value=False)
+    smtp.supports_extension.return_value = False
 
     async def rcpt(recipient: str, **_kwargs: str) -> None:
         if recipient == "rejected@example.test":
@@ -311,14 +311,19 @@ async def test_production_send_path_hides_bcc_from_smtp_and_adds_it_only_to_fres
 
     smtp.rcpt.side_effect = rcpt
 
-    imap = AsyncMock()
-    imap.login.return_value = MagicMock(result="OK", lines=[])
-    imap.id.return_value = MagicMock(result="OK")
+    imap = create_autospec(aioimaplib.IMAP4_SSL, instance=True)
+    imap.login.return_value = aioimaplib.Response("OK", [])
+    imap.id.return_value = aioimaplib.Response("OK", [])
     imap.list.return_value = ("OK", [])
     imap.select.return_value = ("OK", [])
     imap.append.return_value = ("OK", [])
-    imap.protocol = SimpleNamespace(capabilities=("IMAP4rev1",), capability=AsyncMock())
-    sent_handler.incoming_client._connect_imap_server = AsyncMock(return_value=imap)
+    imap.protocol = SimpleNamespace(
+        capabilities=("IMAP4rev1",),
+        capability=create_autospec(aioimaplib.IMAP4ClientProtocol, instance=True).capability,
+    )
+    sent_handler.incoming_client._connect_imap_server = create_autospec(
+        sent_handler.incoming_client._connect_imap_server, return_value=imap
+    )
 
     with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
         result = await services.send.execute(
@@ -343,12 +348,10 @@ async def test_production_send_path_hides_bcc_from_smtp_and_adds_it_only_to_fres
 
 @pytest.mark.asyncio
 async def test_send_delivery_survives_authority_failure_before_sent_copy() -> None:
-    provider = MagicMock()
-    provider.send = AsyncMock(
-        return_value=DeliveryMutationOutcome(
-            (TargetMutationOutcome("accepted@example.test", "succeeded"),),
-            object(),
-        )
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.send.return_value = DeliveryMutationOutcome(
+        (TargetMutationOutcome("accepted@example.test", "succeeded"),),
+        object(),
     )
     services, _, factory, projection = _services(provider=provider)
     factory.open.side_effect = [factory.open.return_value, RuntimeError("configuration changed")]
@@ -369,14 +372,12 @@ async def test_send_delivery_survives_authority_failure_before_sent_copy() -> No
 
 @pytest.mark.asyncio
 async def test_send_delivery_survives_pre_append_sent_copy_cancellation_as_failed() -> None:
-    provider = MagicMock()
-    provider.send = AsyncMock(
-        return_value=DeliveryMutationOutcome(
-            (TargetMutationOutcome("accepted@example.test", "succeeded"),),
-            object(),
-        )
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.send.return_value = DeliveryMutationOutcome(
+        (TargetMutationOutcome("accepted@example.test", "succeeded"),),
+        object(),
     )
-    provider.save_sent_copy = AsyncMock(side_effect=asyncio.CancelledError())
+    provider.save_sent_copy.side_effect = asyncio.CancelledError()
     services, _, _, projection = _services(provider=provider)
 
     result = await services.send.execute(
@@ -396,14 +397,12 @@ async def test_send_delivery_survives_pre_append_sent_copy_cancellation_as_faile
 
 @pytest.mark.asyncio
 async def test_send_delivery_survives_untyped_sent_copy_failure_as_unknown() -> None:
-    provider = MagicMock()
-    provider.send = AsyncMock(
-        return_value=DeliveryMutationOutcome(
-            (TargetMutationOutcome("accepted@example.test", "succeeded"),),
-            object(),
-        )
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.send.return_value = DeliveryMutationOutcome(
+        (TargetMutationOutcome("accepted@example.test", "succeeded"),),
+        object(),
     )
-    provider.save_sent_copy = AsyncMock(side_effect=RuntimeError("unexpected"))
+    provider.save_sent_copy.side_effect = RuntimeError("unexpected")
     services, _, _, projection = _services(provider=provider)
 
     result = await services.send.execute(
@@ -562,8 +561,8 @@ async def test_mutation_error_detail_limit_uses_utf8_bytes_at_boundaries(
         "APPLICATION_LIMITS",
         replace(APPLICATION_LIMITS, error_detail_bytes=4),
     )
-    provider = MagicMock()
-    provider.delete = AsyncMock(return_value=_batch(TargetMutationOutcome("1", "failed", detail)))
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.delete.return_value = _batch(TargetMutationOutcome("1", "failed", detail))
     services, _, _, _ = _services(provider=provider)
 
     if valid:
@@ -585,9 +584,9 @@ async def test_mutation_warning_item_limit_boundaries(
         "APPLICATION_LIMITS",
         replace(APPLICATION_LIMITS, warning_items=2),
     )
-    provider = MagicMock()
-    provider.delete = AsyncMock(
-        return_value=_batch(*(TargetMutationOutcome(str(uid), "failed") for uid in range(1, outcome_count + 1)))
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.delete.return_value = _batch(
+        *(TargetMutationOutcome(str(uid), "failed") for uid in range(1, outcome_count + 1))
     )
     services, _, _, _ = _services(provider=provider)
 
@@ -610,18 +609,18 @@ async def test_mutation_timeout_is_unknown_and_never_replayed(monkeypatch, workf
         "APPLICATION_LIMITS",
         replace(APPLICATION_LIMITS, provider_timeout_seconds=0.001),
     )
-    provider = MagicMock()
+    provider = create_autospec(MutationProvider, instance=True)
     services, _, _, projection = _services(provider=provider)
 
     if workflow == "mark_read":
-        provider.set_flags = AsyncMock(side_effect=_hang_provider)
+        provider.set_flags.side_effect = _hang_provider
         result = await services.mark_read.execute(MarkReadCommand("primary", ("7", "8")))
         assert result.targets("unknown") == ["7", "8"]
         assert result.reconciliation_needed is True
         provider.set_flags.assert_awaited_once()
         projection.invalidate.assert_awaited_once_with(("INBOX",))
     elif workflow == "save":
-        provider.save_to_mailbox = AsyncMock(side_effect=_hang_provider)
+        provider.save_to_mailbox.side_effect = _hang_provider
         result = await services.save_to_mailbox.execute(
             SaveToMailboxCommand(
                 account_name="primary",
@@ -635,7 +634,7 @@ async def test_mutation_timeout_is_unknown_and_never_replayed(monkeypatch, workf
         assert result.reconciliation_needed is True
         provider.save_to_mailbox.assert_awaited_once()
     else:
-        provider.send = AsyncMock(side_effect=_hang_provider)
+        provider.send.side_effect = _hang_provider
         result = await services.send.execute(
             SendCommand(
                 account_name="primary",
@@ -657,14 +656,12 @@ async def test_sent_copy_timeout_preserves_delivery_and_is_unknown(monkeypatch) 
         "APPLICATION_LIMITS",
         replace(APPLICATION_LIMITS, provider_timeout_seconds=0.001),
     )
-    provider = MagicMock()
-    provider.send = AsyncMock(
-        return_value=DeliveryMutationOutcome(
-            (TargetMutationOutcome("recipient@example.test", "succeeded"),),
-            sent_message=object(),
-        )
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.send.return_value = DeliveryMutationOutcome(
+        (TargetMutationOutcome("recipient@example.test", "succeeded"),),
+        sent_message=object(),
     )
-    provider.save_sent_copy = AsyncMock(side_effect=_hang_provider)
+    provider.save_sent_copy.side_effect = _hang_provider
     services, _, _, _ = _services(provider=provider)
 
     result = await services.send.execute(
@@ -686,9 +683,9 @@ async def test_sent_copy_timeout_preserves_delivery_and_is_unknown(monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_save_keeps_missing_parent_mark_through_projection_invalidation() -> None:
-    provider = MagicMock()
-    provider.save_to_mailbox = AsyncMock(
-        return_value=AppendMutationOutcome("succeeded", "<id>", uid="5", mailbox="Drafts", parent_missing=True)
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.save_to_mailbox.return_value = AppendMutationOutcome(
+        "succeeded", "<id>", uid="5", mailbox="Drafts", parent_missing=True
     )
     services, _, _, _ = _services(provider=provider)
 
@@ -701,19 +698,17 @@ async def test_save_keeps_missing_parent_mark_through_projection_invalidation() 
 
 @pytest.mark.asyncio
 async def test_send_keeps_missing_parent_mark_when_sent_copy_saved_and_when_it_fails() -> None:
-    provider = MagicMock()
-    provider.send = AsyncMock(
-        return_value=DeliveryMutationOutcome(
-            (TargetMutationOutcome("to@example.test", "succeeded"),),
-            object(),
-            parent_missing=True,
-        )
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.send.return_value = DeliveryMutationOutcome(
+        (TargetMutationOutcome("to@example.test", "succeeded"),),
+        object(),
+        parent_missing=True,
     )
-    provider.save_sent_copy = AsyncMock(return_value=SentCopyMutationOutcome("succeeded", "Sent"))
+    provider.save_sent_copy.return_value = SentCopyMutationOutcome("succeeded", "Sent")
     services, _, _, _ = _services(provider=provider)
     command = SendCommand(account_name="primary", recipients=("to@example.test",), subject="Subject", body="body")
 
     assert (await services.send.execute(command)).parent_missing is True
 
-    provider.save_sent_copy = AsyncMock(side_effect=RuntimeError("append failed"))
+    provider.save_sent_copy.side_effect = RuntimeError("append failed")
     assert (await services.send.execute(command)).parent_missing is True
