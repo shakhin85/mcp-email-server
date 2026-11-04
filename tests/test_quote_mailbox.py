@@ -1,5 +1,8 @@
 """Tests for IMAP mailbox encoding and quoting helpers."""
 
+from hypothesis import given
+from hypothesis import strategies as st
+
 from mcp_email_server.emails.classic import _quote_mailbox, decode_mailbox_name, encode_mailbox_name
 
 
@@ -71,3 +74,8 @@ class TestModifiedUtf7MailboxCodec:
         """Quoted mailbox arguments should use Modified UTF-7 on the wire."""
         assert _quote_mailbox("Entwürfe") == '"Entw&APw-rfe"'
         assert _quote_mailbox("Gelöschte Elemente") == '"Gel&APY-schte Elemente"'
+
+    @given(st.text())
+    def test_encode_then_decode_round_trips_any_unicode_name(self, name: str):
+        """Any mailbox name survives encoding to the wire form and back."""
+        assert decode_mailbox_name(encode_mailbox_name(name)) == name
