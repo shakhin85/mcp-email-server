@@ -2445,15 +2445,15 @@ class EmailClient:
         # The sender mailbox was formatted from structured identity fields at
         # construction time; do not parse the RFC 5322 header to recover it.
         msg["From"] = self.sender
-        msg["To"] = ", ".join(recipients)
+        msg["To"] = _address_header(recipients)
 
         # Add CC header if provided (visible to recipients)
         if cc:
-            msg["Cc"] = ", ".join(cc)
+            msg["Cc"] = _address_header(cc)
 
         # Add BCC header when saving locally (drafts, sent copies)
         if bcc and include_bcc_header:
-            msg["Bcc"] = ", ".join(bcc)
+            msg["Bcc"] = _address_header(bcc)
 
         # Set threading headers for replies
         if in_reply_to:
@@ -3550,6 +3550,23 @@ class EmailClient:
         return mailboxes
 
 
+def _address_header(addresses: list[str]) -> str:
+    """Encode each display name on its own: a non-ASCII name in a joined value
+    makes the header one encoded-word, which hides the addresses from clients."""
+    return ", ".join(_format_address(address) for address in addresses)
+
+
+def _format_address(raw: str) -> str:
+    """Parse one value alone, so the header names the same address as the envelope."""
+    pairs = [pair for pair in email.utils.getaddresses([raw]) if pair[1]]
+    # An unbalanced quote parses to an addr-spec like ``name <x@y>``: a header reader then
+    # sees ``x@y`` while the envelope holds the whole string.
+    if len(pairs) != 1 or any(char.isspace() or char in "<>" for char in pairs[0][1]):
+        raise ValueError("each recipient value must contain exactly one email address")
+    # ``formataddr`` requires an ASCII addr-spec; a UTF-8 mailbox (RFC 6532) stays as given.
+    return email.utils.formataddr(pairs[0]) if pairs[0][1].isascii() else raw
+
+
 class ResolvedReply(NamedTuple):
     body: str
     thread_index: str | None
@@ -3749,7 +3766,7 @@ class ClassicEmailHandler(EmailHandler):
             # This MUST happen after smtp.send_message() — that ordering is
             # load-bearing for security (BCC must not appear in sent headers).
             if bcc and msg["Bcc"] is None:
-                msg["Bcc"] = ", ".join(bcc)
+                msg["Bcc"] = _address_header(bcc)
             try:
                 await self.outgoing_client.append_to_sent(
                     msg,

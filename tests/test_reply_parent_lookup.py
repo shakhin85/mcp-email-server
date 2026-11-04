@@ -1,6 +1,8 @@
 """A reply finds its parent in a localized Sent folder; a missing parent is reported."""
 
+from email import message_from_bytes
 from email.mime.text import MIMEText
+from email.policy import default
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -174,3 +176,27 @@ async def test_tools_stay_silent_when_parent_found() -> None:
         result = await save_to_mailbox("primary", ["to@example.test"], "Re: x", "Body", in_reply_to=PARENT_ID)
 
     assert "warning" not in result
+
+
+def test_non_ascii_display_names_keep_addresses_readable() -> None:
+    msg = _handler().incoming_client.compose_message(
+        ["Иван Овчаренко <ivan@example.test>", "plain@example.test"],
+        "Subject",
+        "Body",
+        cc=["Артем Суязов <artem@example.test>"],
+    )
+
+    parsed = message_from_bytes(msg.as_bytes(), policy=default)
+    assert [(a.display_name, a.addr_spec) for a in parsed["To"].addresses] == [
+        ("Иван Овчаренко", "ivan@example.test"),
+        ("", "plain@example.test"),
+    ]
+    assert [a.addr_spec for a in parsed["Cc"].addresses] == ["artem@example.test"]
+
+
+@pytest.mark.parametrize(
+    "value", ["x@example.test, extra@example.test", '"unbalanced <x@example.test>', "x@example.test,", ""]
+)
+def test_recipient_value_without_exactly_one_address_is_rejected(value: str) -> None:
+    with pytest.raises(ValueError, match="exactly one email address"):
+        _handler().incoming_client.compose_message([value, "plain@example.test"], "Subject", "Body")
