@@ -118,8 +118,15 @@ def _has_schema_objects(connection: sqlite3.Connection) -> bool:
     )
 
 
+def _version_supported(version: int, mode: IndexMode) -> bool:
+    return version == SCHEMA_VERSION if mode == "managed" else version in (1, SCHEMA_VERSION)
+
+
 def _initialization_in_progress(connection: sqlite3.Connection, mode: IndexMode) -> bool:
     if mode != "legacy":
+        return False
+    row = _schema_version(connection)
+    if row is not None and not _version_supported(row["version"], mode):
         return False
     actual = _schema_objects(connection)
     expected = _expected_schema_objects(_OPERATIONAL_DATABASE_SCHEMA)
@@ -133,9 +140,7 @@ def _preflight_schema_ownership(connection: sqlite3.Connection, mode: IndexMode)
         if _has_schema_objects(connection) or mode == "managed":
             _fail("Operational database schema is missing or incompatible")
         return
-    if (mode == "managed" and row["version"] != SCHEMA_VERSION) or (
-        mode == "legacy" and row["version"] not in (1, SCHEMA_VERSION)
-    ):
+    if not _version_supported(row["version"], mode):
         _fail("Operational database schema version is unsupported")
     try:
         if mode == "managed":
@@ -189,9 +194,7 @@ def _initialize(  # noqa: C901 - bounded initialization and ownership checks
                 row = _schema_version(connection)
                 if row is None:
                     _fail("Operational database initialization did not complete")
-            if (mode == "managed" and row["version"] != SCHEMA_VERSION) or (
-                mode == "legacy" and row["version"] not in (1, SCHEMA_VERSION)
-            ):
+            if not _version_supported(row["version"], mode):
                 _fail("Operational database schema version is unsupported")
             try:
                 if mode == "managed":

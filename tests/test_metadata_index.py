@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -378,6 +379,53 @@ def test_legacy_operational_database_rejects_unsupported_version_before_wal(tmp_
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
     assert not Path(f"{path}-wal").exists()
     assert not Path(f"{path}-shm").exists()
+
+
+def test_unsupported_version_is_rejected_without_waiting(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "operational.sqlite3"
+    index = MetadataIndex(path, "legacy")
+    index.ensure_ready()
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("UPDATE schema_metadata SET version = ?", (SCHEMA_VERSION + 1,))
+        connection.commit()
+
+    started = time.monotonic()
+    with pytest.raises(MetadataIndexError, match="version is unsupported"):
+        index.ensure_ready()
+
+    assert time.monotonic() - started < 1.0
+
+
+def test_incomplete_schema_waits_for_concurrent_initializer(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "operational.sqlite3"
+    index = MetadataIndex(path, "legacy")
+    index.ensure_ready()
+    with closing(sqlite3.connect(path)) as connection:
+        restore = [
+            row[0]
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name = 'legacy_source' AND sql IS NOT NULL ORDER BY type DESC"
+            )
+        ]
+        connection.execute("DROP TABLE legacy_source")
+        connection.commit()
+    assert restore
+
+    def finish_initialization() -> None:
+        time.sleep(0.3)
+        with closing(sqlite3.connect(path)) as connection:
+            for statement in restore:
+                connection.execute(statement)
+            connection.commit()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        finisher = executor.submit(finish_initialization)
+        started = time.monotonic()
+        index.ensure_ready()
+        elapsed = time.monotonic() - started
+        finisher.result()
+
+    assert elapsed >= 0.25
 
 
 def test_coincidental_baseline_version_does_not_claim_unrelated_schema(tmp_path: Path) -> None:
