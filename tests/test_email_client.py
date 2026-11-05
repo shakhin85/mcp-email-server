@@ -6,9 +6,10 @@ from email import policy
 from email.message import EmailMessage
 from email.mime.text import MIMEText
 from email.parser import Parser
-from unittest.mock import ANY, AsyncMock, MagicMock, create_autospec, patch
+from unittest.mock import ANY, AsyncMock, create_autospec, patch
 
 import aioimaplib
+import aiosmtplib
 import pytest
 from aiosmtplib.email import flatten_message
 
@@ -30,8 +31,7 @@ def _imap_double():
     return imap
 
 
-@pytest.fixture
-def email_server():
+def _email_server() -> EmailServer:
     return EmailServer(
         user_name="test_user",
         password="test_password",
@@ -39,6 +39,11 @@ def email_server():
         port=993,
         use_ssl=True,
     )
+
+
+@pytest.fixture
+def email_server():
+    return _email_server()
 
 
 @pytest.fixture
@@ -51,9 +56,8 @@ async def test_prepare_imap_connection_closes_transport_on_greeting_failure() ->
     imap = _imap_double()
     imap._client_task = asyncio.Future()
     imap._client_task.set_result(None)
-    imap.wait_hello_from_server = AsyncMock(side_effect=OSError("greeting failed"))
-    imap.protocol = MagicMock()
-    imap.protocol.transport = MagicMock()
+    imap.wait_hello_from_server.configure_mock(side_effect=OSError("greeting failed"))
+    imap.protocol.transport = create_autospec(asyncio.Transport, instance=True)
     server = EmailServer(
         user_name="user",
         password="secret",
@@ -73,9 +77,7 @@ async def test_prepare_imap_connection_closes_transport_on_starttls_failure() ->
     imap = _imap_double()
     imap._client_task = asyncio.Future()
     imap._client_task.set_result(None)
-    imap.wait_hello_from_server = AsyncMock()
-    imap.protocol = MagicMock()
-    imap.protocol.transport = MagicMock()
+    imap.protocol.transport = create_autospec(asyncio.Transport, instance=True)
     server = EmailServer(
         user_name="user",
         password="secret",
@@ -86,7 +88,11 @@ async def test_prepare_imap_connection_closes_transport_on_starttls_failure() ->
     )
 
     with (
-        patch("mcp_email_server.emails.classic._imap_starttls", AsyncMock(side_effect=OSError("TLS rejected"))),
+        patch(
+            "mcp_email_server.emails.classic._imap_starttls",
+            autospec=True,
+            side_effect=OSError("TLS rejected"),
+        ),
         pytest.raises(OSError, match="TLS rejected"),
     ):
         await EmailClient._prepare_imap_connection(imap, server)
@@ -98,9 +104,7 @@ async def test_prepare_imap_connection_closes_transport_on_starttls_failure() ->
 async def test_prepare_imap_connection_closes_transport_on_cancellation() -> None:
     imap = _imap_double()
     imap._client_task = asyncio.create_task(asyncio.sleep(60))
-    imap.wait_hello_from_server = AsyncMock()
-    imap.protocol = MagicMock()
-    imap.protocol.transport = MagicMock()
+    imap.protocol.transport = create_autospec(asyncio.Transport, instance=True)
     server = EmailServer(
         user_name="user",
         password="secret",
@@ -123,7 +127,7 @@ class TestImapLogin:
     @pytest.mark.asyncio
     async def test_imap_login_ok_returns_none(self):
         imap = _imap_double()
-        imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
 
         await _imap_login(imap, "user@example.com", "secret")
 
@@ -132,7 +136,7 @@ class TestImapLogin:
     @pytest.mark.asyncio
     async def test_imap_login_no_raises_sanitized_connection_error(self):
         imap = _imap_double()
-        imap.login = AsyncMock(return_value=MagicMock(result="NO", lines=[b"Incorrect login credentials"]))
+        imap.login.configure_mock(return_value=aioimaplib.Response("NO", [b"Incorrect login credentials"]))
 
         with pytest.raises(ImapAuthenticationError) as exc_info:
             await _imap_login(imap, "user@example.com", "secret")
@@ -145,7 +149,7 @@ class TestImapLogin:
     @pytest.mark.asyncio
     async def test_imap_login_bad_does_not_expose_non_utf8_provider_detail(self):
         imap = _imap_double()
-        imap.login = AsyncMock(return_value=MagicMock(result="BAD", lines=[b"bad byte: \xff"]))
+        imap.login.configure_mock(return_value=aioimaplib.Response("BAD", [b"bad byte: \xff"]))
 
         with pytest.raises(ImapAuthenticationError) as exc_info:
             await _imap_login(imap, "user@example.com", "secret")
@@ -156,7 +160,7 @@ class TestImapLogin:
 @pytest.mark.asyncio
 async def test_imap_login_timeout_preserves_timeout_category() -> None:
     imap = _imap_double()
-    imap.login = AsyncMock(side_effect=TimeoutError("provider detail"))
+    imap.login.configure_mock(side_effect=TimeoutError("provider detail"))
 
     with pytest.raises(TimeoutError, match="provider detail"):
         await _imap_login(imap, "user@example.com", "secret")
@@ -165,9 +169,12 @@ async def test_imap_login_timeout_preserves_timeout_category() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("email_id", ["1\r\nNOOP", "1 2", "1:*", "1,2", "0", "01", str(2**32), "\u0661"])
 async def test_low_level_read_uid_sinks_reject_before_imap_io(email_client: EmailClient, email_id: str) -> None:
-    connect = AsyncMock(side_effect=AssertionError("invalid UID must not open IMAP"))
-
-    with patch.object(email_client, "_connect_imap", connect):
+    with patch.object(
+        email_client,
+        "_connect_imap",
+        autospec=True,
+        side_effect=AssertionError("invalid UID must not open IMAP"),
+    ) as connect:
         with pytest.raises(ValueError, match=r"canonical|maximum"):
             await email_client.get_email_body_by_id(email_id)
         with pytest.raises(ValueError, match=r"canonical|maximum"):
@@ -178,9 +185,12 @@ async def test_low_level_read_uid_sinks_reject_before_imap_io(email_client: Emai
 
 @pytest.mark.asyncio
 async def test_low_level_mutation_uid_sinks_reject_before_imap_io(email_client: EmailClient) -> None:
-    connect = AsyncMock(side_effect=AssertionError("invalid UID must not open IMAP"))
-
-    with patch.object(email_client, "_connect_imap", connect):
+    with patch.object(
+        email_client,
+        "_connect_imap",
+        autospec=True,
+        side_effect=AssertionError("invalid UID must not open IMAP"),
+    ) as connect:
         for operation in (
             email_client.delete_emails_with_outcome,
             email_client.mark_emails_as_read_with_outcome,
@@ -203,9 +213,9 @@ async def test_get_email_body_accepts_short_fetch_literal(
     raw_email = b"Date: Thu, 1 Jan 2026 00:00:00 +0000\r\nFrom: a@example.test\r\nSubject: Hi\r\n\r\nOK\r\n"
     assert len(raw_email) == 79
     fetch_data = [b"1 FETCH (UID 1 BODY[] {79}", payload_type(raw_email), b")"]
-    mock_imap.uid = AsyncMock(return_value=("OK", fetch_data))
+    mock_imap.uid.configure_mock(return_value=("OK", fetch_data))
 
-    with patch.object(email_client, "_connect_imap", AsyncMock(return_value=mock_imap)):
+    with patch.object(email_client, "_connect_imap", autospec=True, return_value=mock_imap):
         result = await email_client.get_email_body_by_id("1")
 
     assert result is not None
@@ -250,7 +260,7 @@ async def test_fetch_email_rejects_protocol_metadata_without_literal(email_clien
     metadata = [b"1 FETCH (UID 1 FLAGS (" + b"custom-flag " * 10 + b") RFC822.SIZE 123456)"]
     assert len(metadata[0]) > 100
     imap = _imap_double()
-    imap.uid = AsyncMock(return_value=("OK", metadata))
+    imap.uid.configure_mock(return_value=("OK", metadata))
 
     result = await email_client._fetch_email_with_formats(imap, "1")
 
@@ -283,7 +293,7 @@ class TestEmailClient:
 
         raw_email = msg.as_bytes()
 
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
         result = client._parse_email_data(raw_email)
 
         assert result["subject"] == "Test Subject"
@@ -303,7 +313,7 @@ class TestEmailClient:
     def test_parse_email_data_truncates_to_max_body_length(self):
         """A body longer than max_body_length is truncated with the ...[TRUNCATED] marker."""
         raw_email = self._make_raw_email("x" * 100)
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
 
         result = client._parse_email_data(raw_email, max_body_length=10)
         assert result["body"] == "x" * 10 + "...[TRUNCATED]"
@@ -311,7 +321,7 @@ class TestEmailClient:
     def test_parse_email_data_no_marker_when_body_fits(self):
         """A body within the window is returned verbatim, with no marker appended."""
         raw_email = self._make_raw_email("x" * 10)
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
 
         result = client._parse_email_data(raw_email, max_body_length=10)
         assert result["body"] == "x" * 10
@@ -320,7 +330,7 @@ class TestEmailClient:
         """body_offset returns a contiguous, non-overlapping window for paging long bodies."""
         body = "abcdefghij"  # 10 chars
         raw_email = self._make_raw_email(body)
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
 
         # First page: chars [0:4], more remains -> marker appended.
         first = client._parse_email_data(raw_email, body_offset=0, max_body_length=4)
@@ -340,7 +350,7 @@ class TestEmailClient:
     def test_parse_email_data_offset_past_end_returns_empty(self):
         """An offset at or beyond the body length yields an empty body and no marker."""
         raw_email = self._make_raw_email("abc")
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
 
         result = client._parse_email_data(raw_email, body_offset=10, max_body_length=20000)
         assert result["body"] == ""
@@ -348,7 +358,7 @@ class TestEmailClient:
     def test_parse_email_data_rejects_negative_body_offset(self):
         """body_offset must be non-negative, matching the public tool constraint."""
         raw_email = self._make_raw_email("abc")
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
 
         with pytest.raises(ValueError, match="body_offset must be >= 0"):
             client._parse_email_data(raw_email, body_offset=-1, max_body_length=10)
@@ -356,7 +366,7 @@ class TestEmailClient:
     def test_parse_email_data_rejects_non_positive_max_body_length(self):
         """max_body_length must be positive, matching the public tool constraint."""
         raw_email = self._make_raw_email("abc")
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
 
         with pytest.raises(ValueError, match="max_body_length must be >= 1"):
             client._parse_email_data(raw_email, body_offset=0, max_body_length=0)
@@ -432,7 +442,7 @@ class TestEmailClient:
         msg["To"] = "recipient@example.com"
         msg["Date"] = email.utils.formatdate()
 
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
         result = client._parse_email_data(msg.as_bytes())
 
         assert result["subject"] == "HTML Subject"
@@ -452,7 +462,7 @@ class TestEmailClient:
         msg["Date"] = email.utils.formatdate()
         msg.attach(MIMEText("<div>First</div><div>Second &amp; third</div>", "html", "utf-8"))
 
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
         result = client._parse_email_data(msg.as_bytes())
 
         assert "First" in result["body"]
@@ -468,7 +478,7 @@ class TestEmailClient:
         message.set_content("This is the email body")
         message.add_attachment(b"pdf", maintype="application", subtype="pdf", filename="test.pdf")
 
-        client = EmailClient(MagicMock())
+        client = EmailClient(_email_server())
         result = client._parse_email_data(message.as_bytes())
 
         assert result["subject"] == "Test Subject"
@@ -607,11 +617,9 @@ class TestEmailClient:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"1 2 3"]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b"1 2 3"]))
 
         # Mock at the helper level - test behavior, not implementation
         mock_dates = {
@@ -678,11 +686,9 @@ class TestEmailClient:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b""]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b""]))
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             total, emails = await email_client.get_emails_metadata(mailbox="Entwürfe")
@@ -703,11 +709,9 @@ class TestEmailClient:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b""]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b""]))
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             await email_client.get_emails_metadata(mailbox="INBOX")
@@ -727,15 +731,16 @@ class TestEmailClient:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b""]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b""]))
 
-        literal_search = AsyncMock(return_value=("OK", [b""]))
         with patch.object(email_client, "imap_class", return_value=mock_imap):
-            with patch("mcp_email_server.emails.classic._uid_search", literal_search):
+            with patch(
+                "mcp_email_server.emails.classic._uid_search",
+                autospec=True,
+                return_value=("OK", [b""]),
+            ) as literal_search:
                 await email_client.get_emails_metadata(mailbox="INBOX", subject="会议")
 
         literal_search.assert_awaited_once()
@@ -750,11 +755,9 @@ class TestEmailClient:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b""]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b""]))
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             with patch.object(EmailClient, "_build_search_criteria", return_value=["SINCE", "01-MAR-2026"]):
@@ -769,11 +772,9 @@ class TestEmailClient:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"1 2 3"]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b"1 2 3"]))
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             with patch.object(email_client, "_batch_fetch_dates", return_value={}) as mock_fetch_dates:
@@ -791,11 +792,8 @@ class TestEmailClient:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("NO", [b"[NONEXISTENT] Unknown Mailbox: Archive"]))
-        mock_imap.uid_search = AsyncMock()
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("NO", [b"[NONEXISTENT] Unknown Mailbox: Archive"]))
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             with pytest.raises(RuntimeError) as exc_info:
@@ -814,12 +812,8 @@ class TestEmailClient:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("NO", [b"[NONEXISTENT] Unknown Mailbox: Archive"]))
-        mock_imap.uid = AsyncMock()
-        mock_imap.expunge = AsyncMock()
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("NO", [b"[NONEXISTENT] Unknown Mailbox: Archive"]))
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             with pytest.raises(RuntimeError, match="SELECT mailbox Archive failed"):
@@ -833,11 +827,9 @@ class TestEmailClient:
     async def test_send_email(self, email_client):
         """Test sending email."""
         # Mock SMTP client
-        mock_smtp = AsyncMock()
+        mock_smtp = create_autospec(aiosmtplib.SMTP, instance=True)
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
             await email_client.send_email(
@@ -876,7 +868,7 @@ class TestEmailClient:
 async def test_legacy_send_email_preserves_smtputf8_from_header_on_wire(email_server: EmailServer) -> None:
     address = "用户@example.test"
     client = EmailClient(email_server, sender_name="Alice", sender_address=address)
-    smtp = AsyncMock()
+    smtp = create_autospec(aiosmtplib.SMTP, instance=True)
     smtp.__aenter__.return_value = smtp
     smtp.__aexit__.return_value = None
 
@@ -917,11 +909,9 @@ class TestSendEmailMessageIdAndDate:
     @pytest.mark.asyncio
     async def test_send_email_sets_message_id_and_date(self, email_client):
         """Test that send_email sets Message-Id and Date headers."""
-        mock_smtp = AsyncMock()
+        mock_smtp = create_autospec(aiosmtplib.SMTP, instance=True)
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
             msg = await email_client.send_email(
@@ -938,11 +928,9 @@ class TestSendEmailMessageIdAndDate:
     async def test_send_email_message_id_uses_sender_domain(self, email_server):
         """Test that Message-Id domain is extracted from the sender address."""
         client = EmailClient(email_server, sender="user@getsequel.app")
-        mock_smtp = AsyncMock()
+        mock_smtp = create_autospec(aiosmtplib.SMTP, instance=True)
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
             msg = await client.send_email(
@@ -956,11 +944,9 @@ class TestSendEmailMessageIdAndDate:
     @pytest.mark.asyncio
     async def test_send_email_same_message_on_smtp_and_return(self, email_client):
         """Test that the same msg object (with Message-Id) is sent and returned."""
-        mock_smtp = AsyncMock()
+        mock_smtp = create_autospec(aiosmtplib.SMTP, instance=True)
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
             returned_msg = await email_client.send_email(
@@ -1078,11 +1064,9 @@ class TestSendEmailReplyHeaders:
     @pytest.mark.asyncio
     async def test_send_email_sets_in_reply_to_header(self, email_client):
         """Test that In-Reply-To header is set when provided."""
-        mock_smtp = AsyncMock()
+        mock_smtp = create_autospec(aiosmtplib.SMTP, instance=True)
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
             await email_client.send_email(
@@ -1099,11 +1083,9 @@ class TestSendEmailReplyHeaders:
     @pytest.mark.asyncio
     async def test_send_email_sets_references_header(self, email_client):
         """Test that References header is set when provided."""
-        mock_smtp = AsyncMock()
+        mock_smtp = create_autospec(aiosmtplib.SMTP, instance=True)
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
             await email_client.send_email(
@@ -1120,11 +1102,9 @@ class TestSendEmailReplyHeaders:
     @pytest.mark.asyncio
     async def test_send_email_without_reply_headers(self, email_client):
         """Test that send works without reply headers (backward compatibility)."""
-        mock_smtp = AsyncMock()
+        mock_smtp = create_autospec(aiosmtplib.SMTP, instance=True)
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
             await email_client.send_email(
@@ -1199,11 +1179,9 @@ class TestSmtpSslContext:
         )
         client = EmailClient(server, sender="test@example.com")
 
-        mock_smtp = AsyncMock()
+        mock_smtp = create_autospec(aiosmtplib.SMTP, instance=True)
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp) as mock_smtp_class:
             await client.send_email(
@@ -1258,7 +1236,7 @@ class TestBatchFetchDates:
     async def test_batch_fetch_dates_parses_imap_response(self, email_client):
         """Test that _batch_fetch_dates correctly parses IMAP INTERNALDATE responses."""
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=(
                 "OK",
                 [
@@ -1289,7 +1267,7 @@ class TestBatchFetchDates:
     async def test_batch_fetch_dates_handles_fastmail_format(self, email_client):
         """Test that _batch_fetch_dates handles space-padded dates (Fastmail)."""
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=(
                 "OK",
                 [
@@ -1333,7 +1311,7 @@ class TestBatchFetchDates:
             return ("OK", data)
 
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(side_effect=mock_uid_fetch)
+        mock_imap.uid.configure_mock(side_effect=mock_uid_fetch)
 
         result = await email_client._batch_fetch_dates(mock_imap, uid_list, chunk_size=500)
 
@@ -1366,7 +1344,7 @@ class TestBatchFetchDates:
             return ("OK", data)
 
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(side_effect=mock_uid_fetch)
+        mock_imap.uid.configure_mock(side_effect=mock_uid_fetch)
 
         uid_list = [str(i).encode() for i in range(1, 21)]
         await email_client._batch_fetch_dates(mock_imap, uid_list, chunk_size=10)
@@ -1380,7 +1358,7 @@ class TestBatchFetchHeaders:
     async def test_batch_fetch_headers_parses_imap_response(self, email_client):
         """Test that _batch_fetch_headers correctly parses IMAP header responses."""
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=(
                 "OK",
                 [
@@ -1410,7 +1388,7 @@ class TestBatchFetchHeaders:
     async def test_batch_fetch_headers_preserves_uid_mapping(self, email_client):
         """Test that _batch_fetch_headers returns dict keyed by UID."""
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=(
                 "OK",
                 [
@@ -1436,7 +1414,7 @@ class TestBatchFetchSenders:
     @pytest.mark.asyncio
     async def test_batch_fetch_senders(self, email_client):
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=(
                 "OK",
                 [
@@ -1459,11 +1437,9 @@ class TestGetEmailsMetadataSenderFilter:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"1 2 3"]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b"1 2 3"]))
 
         mock_senders = {"1": "alice@example.com", "2": "bob@evil.com", "3": "alice@example.com"}
         mock_dates = {
@@ -1512,11 +1488,9 @@ class TestGetEmailsMetadataSenderFilter:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"1 2 3 4"]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b"1 2 3 4"]))
 
         mock_senders = {
             "1": "alice@example.com",
@@ -1564,11 +1538,9 @@ class TestGetEmailsMetadataSenderFilter:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"1 2 3"]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b"1 2 3"]))
 
         mock_dates = {
             "1": datetime(2024, 1, 1, tzinfo=UTC),
@@ -1625,7 +1597,7 @@ class TestSenderFilterCoverage:
     async def test_batch_fetch_senders_skips_unparseable_header(self, email_client):
         """A header block that fails to parse is skipped, not added."""
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=(
                 "OK",
                 [b"1 FETCH (UID 100 BODY[HEADER.FIELDS (FROM)] {1}", bytearray(b"x"), b")"],
@@ -1639,7 +1611,7 @@ class TestSenderFilterCoverage:
     async def test_batch_fetch_senders_proton_bridge_format(self, email_client):
         """Proton Bridge returns the UID in a trailing item after the header payload."""
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=(
                 "OK",
                 [
@@ -1658,11 +1630,9 @@ class TestSenderFilterCoverage:
         mock_imap = _imap_double()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-        mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"1 2"]))
-        mock_imap.logout = AsyncMock()
+        mock_imap.login.configure_mock(return_value=aioimaplib.Response("OK", []))
+        mock_imap.select.configure_mock(return_value=("OK", []))
+        mock_imap.uid_search.configure_mock(return_value=("OK", [b"1 2"]))
         mock_senders = {"1": "bob@evil.com", "2": "carol@evil.com"}
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             with patch.object(email_client, "_batch_fetch_senders", return_value=mock_senders):
@@ -1678,7 +1648,7 @@ class TestSenderFilterCoverage:
     async def test_batch_fetch_senders_non_bytearray_payload_skipped(self, email_client):
         """An item whose payload is not a bytearray matches neither branch and is skipped."""
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=("OK", [b"1 FETCH (UID 100 BODY[HEADER.FIELDS (FROM)] {0}", b"not-bytearray", b")"])
         )
         result = await email_client._batch_fetch_senders(mock_imap, [b"100"])
@@ -1688,7 +1658,7 @@ class TestSenderFilterCoverage:
     async def test_batch_fetch_senders_proton_missing_uid_skipped(self, email_client):
         """A trailing-payload item with no UID is skipped."""
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=("OK", [b"1 FETCH (BODY[HEADER.FIELDS (FROM)] {x}", bytearray(b"From: a@b.com\r\n\r\n"), b")"])
         )
         result = await email_client._batch_fetch_senders(mock_imap, [b"100"])
@@ -1698,7 +1668,7 @@ class TestSenderFilterCoverage:
     async def test_batch_fetch_senders_proton_unparseable_skipped(self, email_client):
         """A trailing-UID item whose header fails to parse is skipped."""
         mock_imap = _imap_double()
-        mock_imap.uid = AsyncMock(
+        mock_imap.uid.configure_mock(
             return_value=("OK", [b"1 FETCH (BODY[HEADER.FIELDS (FROM)] {1}", bytearray(b"x"), b" UID 300)"])
         )
         with patch.object(email_client, "_parse_headers", return_value=None):
