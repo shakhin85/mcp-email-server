@@ -5,7 +5,7 @@ Covers the new functionality introduced in PR #147.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from unittest.mock import create_autospec, patch
 
 import aioimaplib
 import pytest
@@ -70,15 +70,13 @@ def _make_mock_imap(**overrides):
     mock = create_autospec(aioimaplib.IMAP4_SSL, instance=True)
     mock._client_task = asyncio.Future()
     mock._client_task.set_result(None)
-    mock.wait_hello_from_server = AsyncMock()
-    mock.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
-    mock.select = AsyncMock(return_value=("OK", []))
-    mock.uid = AsyncMock(return_value=("OK", []))
-    mock.expunge = AsyncMock(return_value=("OK", []))
-    mock.logout = AsyncMock()
-    mock.list = AsyncMock(return_value=("OK", []))
-    mock.protocol = MagicMock(capabilities=capabilities)
-    mock.protocol.capability = AsyncMock()
+    mock.login.return_value = Response("OK", [])
+    mock.select.return_value = ("OK", [])
+    mock.uid.return_value = ("OK", [])
+    mock.expunge.return_value = ("OK", [])
+    mock.list.return_value = ("OK", [])
+    mock.protocol = create_autospec(aioimaplib.IMAP4ClientProtocol, instance=True)
+    mock.protocol.capabilities = capabilities
     for k, v in overrides.items():
         setattr(mock, k, v)
     return mock
@@ -109,7 +107,7 @@ async def test_move_uses_post_auth_capabilities_and_rejects_fallback_before_copy
     async def refresh_capabilities():
         mock_imap.protocol.capabilities = ("IMAP4rev1",)
 
-    mock_imap.protocol.capability = AsyncMock(side_effect=refresh_capabilities)
+    mock_imap.protocol.capability.side_effect = refresh_capabilities
     with patch.object(email_client, "imap_class", return_value=mock_imap):
         result = await email_client.move_emails(["100"], "INBOX", "Archive")
 
@@ -124,7 +122,7 @@ async def test_move_normalizes_post_auth_move_for_check_and_command(email_client
     async def refresh_capabilities():
         mock_imap.protocol.capabilities = ("imap4rev1", "move")
 
-    mock_imap.protocol.capability = AsyncMock(side_effect=refresh_capabilities)
+    mock_imap.protocol.capability.side_effect = refresh_capabilities
     with patch.object(email_client, "imap_class", return_value=mock_imap):
         result = await email_client.move_emails(["100"], "INBOX", "Archive")
 
@@ -192,7 +190,6 @@ class TestEmailClientMoveEmails:
     async def test_move_emails_with_move_capability(self, email_client):
         """When MOVE capability is present, should use UID MOVE directly."""
         mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE", "IDLE"))
-        mock_imap.move = AsyncMock()  # retained compatibility test double
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Trash")
@@ -218,7 +215,7 @@ class TestEmailClientMoveEmails:
             Exception("IMAP error"),  # copy "200" fails
             Response("OK", [b"expunged"]),  # scoped expunge for "100"
         ]
-        mock_imap.uid = AsyncMock(side_effect=side_effects)
+        mock_imap.uid.side_effect = side_effects
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100", "200"], "INBOX", "Archive")
@@ -234,7 +231,7 @@ class TestEmailClientMoveEmails:
         mock_imap = _make_mock_imap()
         del mock_imap.move
 
-        mock_imap.uid = AsyncMock(side_effect=Exception("IMAP error"))
+        mock_imap.uid.side_effect = Exception("IMAP error")
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Archive")
@@ -248,7 +245,7 @@ class TestEmailClientMoveEmails:
         """Logout errors in the finally block should not propagate."""
         mock_imap = _make_mock_imap()
         del mock_imap.move
-        mock_imap.logout = AsyncMock(side_effect=Exception("Logout failed"))
+        mock_imap.logout.side_effect = Exception("Logout failed")
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Archive")
@@ -274,7 +271,7 @@ class TestEmailClientMoveEmails:
     async def test_move_emails_move_capability_with_failure(self, email_client):
         """Test failure when using native MOVE command."""
         mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"))
-        mock_imap.uid = AsyncMock(side_effect=Exception("MOVE failed"))
+        mock_imap.uid.side_effect = Exception("MOVE failed")
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Trash")
@@ -287,7 +284,7 @@ class TestEmailClientMoveEmails:
         """A COPY NO response should fail the email before STORE \\Deleted is sent."""
         mock_imap = _make_mock_imap()
         del mock_imap.move
-        mock_imap.uid = AsyncMock(return_value=Response("NO", [b"[TRYCREATE] mailbox does not exist"]))
+        mock_imap.uid.return_value = Response("NO", [b"[TRYCREATE] mailbox does not exist"])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Missing")
@@ -302,12 +299,10 @@ class TestEmailClientMoveEmails:
         """A STORE NO response should fail the email and skip EXPUNGE."""
         mock_imap = _make_mock_imap()
         del mock_imap.move
-        mock_imap.uid = AsyncMock(
-            side_effect=[
-                Response("OK", [b"copied"]),
-                Response("NO", [b"store failed"]),
-            ]
-        )
+        mock_imap.uid.side_effect = [
+            Response("OK", [b"copied"]),
+            Response("NO", [b"store failed"]),
+        ]
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Archive")
@@ -321,7 +316,7 @@ class TestEmailClientMoveEmails:
     async def test_move_emails_move_no_response_marks_failed(self, email_client):
         """A native MOVE NO response should be reported as a failed move."""
         mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"))
-        mock_imap.uid = AsyncMock(return_value=Response("NO", [b"move failed"]))
+        mock_imap.uid.return_value = Response("NO", [b"move failed"])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Trash")
@@ -335,7 +330,7 @@ class TestEmailClientMoveEmails:
         """A source mailbox SELECT NO response should stop before any move commands."""
         mock_imap = _make_mock_imap()
         del mock_imap.move
-        mock_imap.select = AsyncMock(return_value=Response("NO", [b"source missing"]))
+        mock_imap.select.return_value = Response("NO", [b"source missing"])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             with pytest.raises(RuntimeError, match="SELECT source mailbox Missing"):
@@ -349,13 +344,11 @@ class TestEmailClientMoveEmails:
         """An EXPUNGE NO response should report copied and flagged emails as failed."""
         mock_imap = _make_mock_imap()
         del mock_imap.move
-        mock_imap.uid = AsyncMock(
-            side_effect=[
-                Response("OK", [b"copied"]),
-                Response("OK", [b"stored"]),
-                Response("NO", [b"expunge failed"]),
-            ]
-        )
+        mock_imap.uid.side_effect = [
+            Response("OK", [b"copied"]),
+            Response("OK", [b"stored"]),
+            Response("NO", [b"expunge failed"]),
+        ]
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Archive")
@@ -378,16 +371,14 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_parses_standard_response(self, email_client):
         """Standard IMAP LIST responses should be parsed into MailboxInfo objects."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [
-                    b'(\\HasChildren) "/" "INBOX"',
-                    b'(\\Sent \\HasNoChildren) "/" "Sent"',
-                    b'(\\Drafts \\HasNoChildren) "/" "Drafts"',
-                    b'(\\Trash \\HasNoChildren) "/" "Trash"',
-                ],
-            )
+        mock_imap.list.return_value = (
+            "OK",
+            [
+                b'(\\HasChildren) "/" "INBOX"',
+                b'(\\Sent \\HasNoChildren) "/" "Sent"',
+                b'(\\Drafts \\HasNoChildren) "/" "Drafts"',
+                b'(\\Trash \\HasNoChildren) "/" "Trash"',
+            ],
         )
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
@@ -415,15 +406,13 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_with_dot_delimiter(self, email_client):
         """Mailboxes with dot delimiters (e.g., Dovecot) should parse correctly."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [
-                    b'(\\HasChildren) "." "INBOX"',
-                    b'(\\HasNoChildren) "." "INBOX.Clients"',
-                    b'(\\HasNoChildren) "." "INBOX.Projects"',
-                ],
-            )
+        mock_imap.list.return_value = (
+            "OK",
+            [
+                b'(\\HasChildren) "." "INBOX"',
+                b'(\\HasNoChildren) "." "INBOX.Clients"',
+                b'(\\HasNoChildren) "." "INBOX.Projects"',
+            ],
         )
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
@@ -438,15 +427,13 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_skips_empty_items(self, email_client):
         """Empty bytes items in the IMAP response should be silently skipped."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [
-                    b'(\\HasNoChildren) "/" "INBOX"',
-                    b"",
-                    b'(\\HasNoChildren) "/" "Sent"',
-                ],
-            )
+        mock_imap.list.return_value = (
+            "OK",
+            [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b"",
+                b'(\\HasNoChildren) "/" "Sent"',
+            ],
         )
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
@@ -460,15 +447,13 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_decodes_exchange_modified_utf7_and_atoms(self, email_client):
         """Exchange LIST responses with localized folder names should parse correctly."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [
-                    b'(\\HasChildren) "/" Posteingang',
-                    b'(\\Drafts \\HasNoChildren) "/" Entw&APw-rfe',
-                    b'(\\Trash \\HasNoChildren) "/" "Gel&APY-schte Elemente"',
-                ],
-            )
+        mock_imap.list.return_value = (
+            "OK",
+            [
+                b'(\\HasChildren) "/" Posteingang',
+                b'(\\Drafts \\HasNoChildren) "/" Entw&APw-rfe',
+                b'(\\Trash \\HasNoChildren) "/" "Gel&APY-schte Elemente"',
+            ],
         )
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
@@ -487,7 +472,7 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_with_nil_delimiter(self, email_client):
         """NIL hierarchy delimiters should be exposed as an empty string."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(return_value=("OK", [b'(\\Noselect) NIL ""']))
+        mock_imap.list.return_value = ("OK", [b'(\\Noselect) NIL ""'])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             result = await email_client.list_mailboxes()
@@ -501,7 +486,7 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_with_escaped_quoted_name(self, email_client):
         """Quoted mailbox strings may contain escaped characters."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(return_value=("OK", [b'(\\HasNoChildren) "/" "Project \\"A\\""']))
+        mock_imap.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "Project \\"A\\""'])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             result = await email_client.list_mailboxes()
@@ -514,13 +499,11 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_with_pattern(self, email_client):
         """A custom pattern should be passed through to IMAP LIST."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [
-                    b'(\\HasNoChildren) "/" "INBOX.Sub1"',
-                ],
-            )
+        mock_imap.list.return_value = (
+            "OK",
+            [
+                b'(\\HasNoChildren) "/" "INBOX.Sub1"',
+            ],
         )
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
@@ -533,7 +516,7 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_quotes_encoded_pattern_with_spaces(self, email_client):
         """Exact localized mailbox patterns should be encoded and quoted."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(return_value=("OK", []))
+        mock_imap.list.return_value = ("OK", [])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             result = await email_client.list_mailboxes(pattern="Gelöschte Elemente")
@@ -545,7 +528,7 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_quotes_encoded_pattern_preserving_wildcards(self, email_client):
         """Wildcard patterns should remain wildcard patterns after quoting."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(return_value=("OK", []))
+        mock_imap.list.return_value = ("OK", [])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             result = await email_client.list_mailboxes(pattern="Gelöschte *")
@@ -557,7 +540,7 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_with_reference(self, email_client):
         """A custom reference should be quoted and passed through."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(return_value=("OK", []))
+        mock_imap.list.return_value = ("OK", [])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             result = await email_client.list_mailboxes(reference="INBOX")
@@ -569,7 +552,7 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_empty_response(self, email_client):
         """An empty LIST response should return an empty list."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(return_value=("OK", []))
+        mock_imap.list.return_value = ("OK", [])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             result = await email_client.list_mailboxes()
@@ -580,13 +563,11 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_logout_error_handled(self, email_client):
         """Logout errors should not prevent the result from being returned."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [b'(\\HasNoChildren) "/" "INBOX"'],
-            )
+        mock_imap.list.return_value = (
+            "OK",
+            [b'(\\HasNoChildren) "/" "INBOX"'],
         )
-        mock_imap.logout = AsyncMock(side_effect=Exception("Logout failed"))
+        mock_imap.logout.side_effect = Exception("Logout failed")
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             result = await email_client.list_mailboxes()
@@ -598,11 +579,9 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_empty_flags(self, email_client):
         """A mandatory but empty LIST attribute section produces no flags."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [b'() "/" "SomeFolder"'],
-            )
+        mock_imap.list.return_value = (
+            "OK",
+            [b'() "/" "SomeFolder"'],
         )
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
@@ -618,13 +597,11 @@ class TestEmailClientListMailboxes:
         """Non-bytes items in the response should be handled via str()."""
         mock_imap = _make_mock_imap()
         # Some IMAP libs may return strings instead of bytes
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [
-                    '(\\HasNoChildren) "/" "Junk"',  # already a str
-                ],
-            )
+        mock_imap.list.return_value = (
+            "OK",
+            [
+                '(\\HasNoChildren) "/" "Junk"',  # already a str
+            ],
         )
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
@@ -638,7 +615,7 @@ class TestEmailClientListMailboxes:
     async def test_list_mailboxes_no_response_raises(self, email_client):
         """A LIST NO response should raise a clear error."""
         mock_imap = _make_mock_imap()
-        mock_imap.list = AsyncMock(return_value=Response("NO", [b"LIST failed"]))
+        mock_imap.list.return_value = Response("NO", [b"LIST failed"])
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             with pytest.raises(RuntimeError, match="LIST mailboxes with pattern"):
@@ -658,7 +635,7 @@ class TestClassicHandlerMoveEmails:
     @pytest.mark.asyncio
     async def test_move_emails_delegates(self, classic_handler):
         """ClassicEmailHandler.move_emails should delegate to incoming_client."""
-        mock_move = AsyncMock(return_value=(["100", "200"], []))
+        mock_move = create_autospec(classic_handler.incoming_client.move_emails, return_value=(["100", "200"], []))
 
         with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
             moved, failed = await classic_handler.move_emails(
@@ -676,7 +653,7 @@ class TestClassicHandlerMoveEmails:
     @pytest.mark.asyncio
     async def test_move_emails_with_failures(self, classic_handler):
         """Partial failures should be propagated correctly."""
-        mock_move = AsyncMock(return_value=(["100"], ["200"]))
+        mock_move = create_autospec(classic_handler.incoming_client.move_emails, return_value=(["100"], ["200"]))
 
         with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
             moved, failed = await classic_handler.move_emails(
@@ -694,7 +671,7 @@ class TestClassicHandlerMoveEmails:
     @pytest.mark.asyncio
     async def test_move_emails_custom_source(self, classic_handler):
         """A custom source mailbox should be passed through."""
-        mock_move = AsyncMock(return_value=(["300"], []))
+        mock_move = create_autospec(classic_handler.incoming_client.move_emails, return_value=(["300"], []))
 
         with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
             moved, _failed = await classic_handler.move_emails(
@@ -717,8 +694,8 @@ class TestClassicHandlerArchiveEmails:
             MailboxInfo(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
             MailboxInfo(name="All Mail", delimiter="/", flags=["\\Archive", "\\HasNoChildren"]),
         ]
-        mock_list = AsyncMock(return_value=mailboxes)
-        mock_move = AsyncMock(return_value=(["100"], []))
+        mock_list = create_autospec(classic_handler.incoming_client.list_mailboxes, return_value=mailboxes)
+        mock_move = create_autospec(classic_handler.incoming_client.move_emails, return_value=(["100"], []))
 
         with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
@@ -738,8 +715,8 @@ class TestClassicHandlerArchiveEmails:
             MailboxInfo(name="INBOX", delimiter="/", flags=[]),
             MailboxInfo(name="Archive", delimiter="/", flags=["\\HasNoChildren"]),
         ]
-        mock_list = AsyncMock(return_value=mailboxes)
-        mock_move = AsyncMock(return_value=(["100", "200"], []))
+        mock_list = create_autospec(classic_handler.incoming_client.list_mailboxes, return_value=mailboxes)
+        mock_move = create_autospec(classic_handler.incoming_client.move_emails, return_value=(["100", "200"], []))
 
         with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
@@ -758,8 +735,8 @@ class TestClassicHandlerArchiveEmails:
             MailboxInfo(name="INBOX", delimiter="/", flags=[]),
             MailboxInfo(name="archive", delimiter="/", flags=[]),
         ]
-        mock_list = AsyncMock(return_value=mailboxes)
-        mock_move = AsyncMock(return_value=(["100"], []))
+        mock_list = create_autospec(classic_handler.incoming_client.list_mailboxes, return_value=mailboxes)
+        mock_move = create_autospec(classic_handler.incoming_client.move_emails, return_value=(["100"], []))
 
         with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
@@ -775,8 +752,11 @@ class TestClassicHandlerArchiveEmails:
     @pytest.mark.asyncio
     async def test_archive_raises_when_no_archive_folder(self, classic_handler):
         """A ValueError is raised when no Archive folder can be found."""
-        mock_list = AsyncMock(return_value=[MailboxInfo(name="INBOX", delimiter="/", flags=[])])
-        mock_move = AsyncMock()
+        mock_list = create_autospec(
+            classic_handler.incoming_client.list_mailboxes,
+            return_value=[MailboxInfo(name="INBOX", delimiter="/", flags=[])],
+        )
+        mock_move = create_autospec(classic_handler.incoming_client.move_emails)
 
         with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
@@ -796,7 +776,7 @@ class TestClassicHandlerListMailboxes:
             MailboxInfo(name="INBOX", delimiter="/", flags=["\\HasChildren"]),
             MailboxInfo(name="Sent", delimiter="/", flags=["\\Sent"]),
         ]
-        mock_list = AsyncMock(return_value=expected)
+        mock_list = create_autospec(classic_handler.incoming_client.list_mailboxes, return_value=expected)
 
         with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             result = await classic_handler.list_mailboxes()
@@ -808,7 +788,7 @@ class TestClassicHandlerListMailboxes:
     async def test_list_mailboxes_with_pattern(self, classic_handler):
         """Custom pattern should be forwarded."""
         expected = [MailboxInfo(name="INBOX.Sub", delimiter=".", flags=[])]
-        mock_list = AsyncMock(return_value=expected)
+        mock_list = create_autospec(classic_handler.incoming_client.list_mailboxes, return_value=expected)
 
         with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             result = await classic_handler.list_mailboxes(pattern="INBOX.*")
@@ -819,7 +799,7 @@ class TestClassicHandlerListMailboxes:
     @pytest.mark.asyncio
     async def test_list_mailboxes_with_reference(self, classic_handler):
         """Custom reference should be forwarded."""
-        mock_list = AsyncMock(return_value=[])
+        mock_list = create_autospec(classic_handler.incoming_client.list_mailboxes, return_value=[])
 
         with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             result = await classic_handler.list_mailboxes(pattern="*", reference="ns")
@@ -830,7 +810,7 @@ class TestClassicHandlerListMailboxes:
     @pytest.mark.asyncio
     async def test_list_mailboxes_empty(self, classic_handler):
         """An account with no discoverable mailboxes should return an empty list."""
-        mock_list = AsyncMock(return_value=[])
+        mock_list = create_autospec(classic_handler.incoming_client.list_mailboxes, return_value=[])
 
         with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             result = await classic_handler.list_mailboxes()

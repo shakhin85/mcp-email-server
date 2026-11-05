@@ -1,7 +1,7 @@
 import asyncio
 import ssl
 from email.mime.text import MIMEText
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import create_autospec, patch
 
 import aioimaplib
 import pytest
@@ -23,20 +23,24 @@ class Response:
 
 
 def _make_imap(capabilities=("IMAP4rev1", "STARTTLS")):
-    imap = AsyncMock()
+    imap = create_autospec(aioimaplib.IMAP4, instance=True)
     imap.timeout = 10
     imap._client_task = asyncio.Future()
     imap._client_task.set_result(None)
-    imap.wait_hello_from_server = AsyncMock()
-    imap.protocol = MagicMock()
+    imap.protocol = create_autospec(aioimaplib.IMAP4ClientProtocol, instance=True)
     imap.protocol.capabilities = set(capabilities)
     imap.protocol.pending_async_commands = {}
     imap.protocol.loop = asyncio.get_event_loop()
     imap.protocol.new_tag.return_value = "A001"
-    imap.protocol.execute = AsyncMock(return_value=Response("OK"))
-    imap.protocol.capability = AsyncMock()
-    imap.protocol.transport = MagicMock(spec=asyncio.Transport)
+    imap.protocol.execute.return_value = Response("OK")
+    imap.protocol.transport = create_autospec(asyncio.Transport, instance=True)
     return imap
+
+
+def _make_loop(start_tls_result):
+    loop = create_autospec(asyncio.AbstractEventLoop, instance=True)
+    loop.start_tls.return_value = start_tls_result
+    return loop
 
 
 def test_email_settings_init_accepts_imap_start_ssl():
@@ -184,7 +188,7 @@ async def test_send_imap_id_discards_connection_after_transport_failure():
 
 @pytest.mark.asyncio
 async def test_send_imap_id_handles_missing_protocol():
-    imap = AsyncMock()
+    imap = create_autospec(aioimaplib.IMAP4, instance=True)
     imap.protocol = None
 
     with patch("mcp_email_server.emails.classic.logger.warning") as mock_warning:
@@ -197,13 +201,10 @@ async def test_send_imap_id_handles_missing_protocol():
 @pytest.mark.asyncio
 async def test_imap_starttls_upgrades_transport_and_refreshes_capabilities():
     imap = _make_imap()
-    tls_transport = MagicMock()
+    tls_transport = create_autospec(asyncio.Transport, instance=True)
+    mock_loop = _make_loop(tls_transport)
 
-    with patch("asyncio.get_running_loop") as mock_get_loop:
-        mock_loop = MagicMock()
-        mock_loop.start_tls = AsyncMock(return_value=tls_transport)
-        mock_get_loop.return_value = mock_loop
-
+    with patch("asyncio.get_running_loop", autospec=True, return_value=mock_loop):
         await _imap_starttls(imap, ssl.create_default_context(), "127.0.0.1")
 
     imap.protocol.execute.assert_awaited_once()
@@ -234,11 +235,9 @@ async def test_imap_starttls_requires_connected_transport():
 async def test_imap_starttls_requires_upgraded_transport():
     imap = _make_imap()
 
-    with patch("asyncio.get_running_loop") as mock_get_loop:
-        mock_loop = MagicMock()
-        mock_loop.start_tls = AsyncMock(return_value=None)
-        mock_get_loop.return_value = mock_loop
+    mock_loop = _make_loop(None)
 
+    with patch("asyncio.get_running_loop", autospec=True, return_value=mock_loop):
         with pytest.raises(ConnectionError, match="IMAP STARTTLS did not return a transport"):
             await _imap_starttls(imap, ssl.create_default_context(), "127.0.0.1")
 
@@ -257,7 +256,7 @@ async def test_imap_starttls_requires_server_capability():
 @pytest.mark.asyncio
 async def test_imap_starttls_raises_when_command_fails():
     imap = _make_imap()
-    imap.protocol.execute = AsyncMock(return_value=Response("NO"))
+    imap.protocol.execute.return_value = Response("NO")
 
     with pytest.raises(OSError, match="STARTTLS command failed: NO"):
         await _imap_starttls(imap, ssl.create_default_context(), "127.0.0.1")
@@ -275,7 +274,9 @@ async def test_connect_imap_uses_implicit_tls_when_use_ssl_true():
     )
     mock_imap = _make_imap()
 
-    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4_SSL", return_value=mock_imap) as mock_ssl:
+    with patch(
+        "mcp_email_server.emails.classic.aioimaplib.IMAP4_SSL", autospec=True, return_value=mock_imap
+    ) as mock_ssl:
         result = await EmailClient._connect_imap_server(server)
 
     assert result is mock_imap
@@ -294,7 +295,7 @@ def test_imap_connect_uses_custom_context_when_verification_disabled():
         verify_ssl=False,
     )
     client = EmailClient(server)
-    mock_imap_class = MagicMock()
+    mock_imap_class = create_autospec(aioimaplib.IMAP4_SSL)
     client.imap_class = mock_imap_class
 
     result = client._imap_connect()
@@ -319,8 +320,8 @@ async def test_connect_imap_uses_plain_connection_without_starttls():
     )
     mock_imap = _make_imap()
 
-    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4", return_value=mock_imap) as mock_plain:
-        with patch("mcp_email_server.emails.classic._imap_starttls", new=AsyncMock()) as mock_starttls:
+    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4", autospec=True, return_value=mock_imap) as mock_plain:
+        with patch("mcp_email_server.emails.classic._imap_starttls", autospec=True) as mock_starttls:
             result = await EmailClient._connect_imap_server(server)
 
     assert result is mock_imap
@@ -341,8 +342,8 @@ async def test_connect_imap_uses_starttls_when_configured():
     )
     mock_imap = _make_imap()
 
-    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4", return_value=mock_imap) as mock_plain:
-        with patch("mcp_email_server.emails.classic._imap_starttls", new=AsyncMock()) as mock_starttls:
+    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4", autospec=True, return_value=mock_imap) as mock_plain:
+        with patch("mcp_email_server.emails.classic._imap_starttls", autospec=True) as mock_starttls:
             result = await EmailClient._connect_imap_server(server)
 
     assert result is mock_imap
@@ -366,13 +367,12 @@ async def test_append_to_mailbox_uses_incoming_starttls_path():
     )
     client = EmailClient(outgoing)
     mock_imap = _make_imap()
-    mock_imap.login = AsyncMock(return_value=Response("OK"))
-    mock_imap.select = AsyncMock(return_value=("OK", []))
-    mock_imap.append = AsyncMock(return_value=("OK", []))
-    mock_imap.logout = AsyncMock()
+    mock_imap.login.return_value = Response("OK")
+    mock_imap.select.return_value = ("OK", [])
+    mock_imap.append.return_value = ("OK", [])
 
-    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4", return_value=mock_imap):
-        with patch("mcp_email_server.emails.classic._imap_starttls", new=AsyncMock()) as mock_starttls:
+    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4", autospec=True, return_value=mock_imap):
+        with patch("mcp_email_server.emails.classic._imap_starttls", autospec=True) as mock_starttls:
             result = await client.append_to_mailbox(MIMEText("message"), incoming, "Drafts")
 
     assert result == "unknown"
