@@ -145,3 +145,4 @@ config.toml
 local-reference/
 scratchpad/
 .codegraph/
+.claude/

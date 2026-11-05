@@ -722,7 +722,7 @@ def _parent_bodies(message: Message) -> tuple[str, str]:
 
     def decode(part: Message) -> str:
         payload = part.get_payload(decode=True)
-        if not payload:
+        if not isinstance(payload, bytes) or not payload:
             return ""
         charset = part.get_content_charset("utf-8")
         try:
