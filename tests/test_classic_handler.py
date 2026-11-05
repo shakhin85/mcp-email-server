@@ -3,11 +3,13 @@ from email import policy
 from email.message import EmailMessage
 from email.parser import Parser
 from typing import ClassVar
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
+import aioimaplib
+import aiosmtplib
 import pytest
 
-from mcp_email_server.config import EmailServer, EmailSettings
+from mcp_email_server.config import EmailServer, EmailSettings, Settings
 from mcp_email_server.emails.classic import (
     ClassicEmailHandler,
     EmailClient,
@@ -49,6 +51,36 @@ def email_settings():
 @pytest.fixture
 def classic_handler(email_settings):
     return ClassicEmailHandler(email_settings)
+
+
+def _settings(**fields) -> Settings:
+    """Real Settings without env/TOML loading, so unknown fields fail loudly."""
+    return Settings.model_construct(**fields)
+
+
+def _make_imap_double() -> aioimaplib.IMAP4_SSL:
+    return create_autospec(aioimaplib.IMAP4_SSL, instance=True)
+
+
+def _make_smtp_double() -> aiosmtplib.SMTP:
+    smtp = create_autospec(aiosmtplib.SMTP, instance=True)
+    smtp.__aenter__.return_value = smtp
+    smtp.__aexit__.return_value = None
+    return smtp
+
+
+@pytest.fixture
+def mock_imap(completed_awaitable):
+    """IMAP double bound to the aioimaplib.IMAP4_SSL signature."""
+    imap = _make_imap_double()
+    imap._client_task = completed_awaitable
+    imap.protocol = create_autospec(aioimaplib.IMAP4ClientProtocol, instance=True)
+    imap.protocol.capabilities = ("IMAP4rev1",)
+    imap.login.return_value = MagicMock(result="OK", lines=[])
+    imap.select.return_value = ("OK", [])
+    imap.search.return_value = (None, [b"1 2 3"])
+    imap.fetch.return_value = (None, [b"HEADER", bytearray(b"EMAIL CONTENT")])
+    return imap
 
 
 def test_sender_identity_quotes_rfc5322_display_name_and_keeps_envelope_address(
@@ -141,10 +173,12 @@ class TestClassicEmailHandler:
         }
 
         # Mock get_emails_metadata to return (total, email_dicts)
-        mock_get_metadata = AsyncMock(return_value=(1, [email_data]))
+        mock_get_metadata = create_autospec(
+            classic_handler.incoming_client.get_emails_metadata, return_value=(1, [email_data])
+        )
 
         # Apply the mock
-        with patch("mcp_email_server.emails.classic.get_settings", return_value=MagicMock(allowed_senders=[])):
+        with patch("mcp_email_server.emails.classic.get_settings", return_value=_settings(allowed_senders=[])):
             with patch.object(classic_handler.incoming_client, "get_emails_metadata", mock_get_metadata):
                 # Call the method
                 result = await classic_handler.get_emails_metadata(
@@ -205,9 +239,11 @@ class TestClassicEmailHandler:
             "attachments": [],
         }
 
-        mock_get_metadata = AsyncMock(return_value=(1, [email_data]))
+        mock_get_metadata = create_autospec(
+            classic_handler.incoming_client.get_emails_metadata, return_value=(1, [email_data])
+        )
 
-        with patch("mcp_email_server.emails.classic.get_settings", return_value=MagicMock(allowed_senders=[])):
+        with patch("mcp_email_server.emails.classic.get_settings", return_value=_settings(allowed_senders=[])):
             with patch.object(classic_handler.incoming_client, "get_emails_metadata", mock_get_metadata):
                 result = await classic_handler.get_emails_metadata(
                     page=1,
@@ -242,7 +278,7 @@ class TestClassicEmailHandler:
     async def test_send_email(self, classic_handler):
         """Test send_email method."""
         # Mock the outgoing_client.send_email method
-        mock_send = AsyncMock()
+        mock_send = create_autospec(classic_handler.outgoing_client.send_email)
 
         # Apply the mock
         with patch.object(classic_handler.outgoing_client, "send_email", mock_send):
@@ -279,7 +315,7 @@ class TestClassicEmailHandler:
         test_file.write_text("This is a test attachment")
 
         # Mock the outgoing_client.send_email method
-        mock_send = AsyncMock()
+        mock_send = create_autospec(classic_handler.outgoing_client.send_email)
 
         # Apply the mock
         with patch.object(classic_handler.outgoing_client, "send_email", mock_send):
@@ -320,8 +356,8 @@ class TestClassicEmailHandler:
             "body_text": "Original body",
             "body_html": "",
         }
-        mock_send = AsyncMock()
-        mock_lookup = AsyncMock(return_value=parent)
+        mock_send = create_autospec(classic_handler.outgoing_client.send_email)
+        mock_lookup = create_autospec(classic_handler.incoming_client._lookup_parent, return_value=parent)
 
         with (
             patch.object(classic_handler.outgoing_client, "send_email", mock_send),
@@ -346,8 +382,8 @@ class TestClassicEmailHandler:
     async def test_send_email_reply_quote_history_disabled(self, classic_handler):
         """quote_history=False keeps the body as-is but still threads the reply."""
         parent = {"thread_index": "AdX0parentIndex==", "body_text": "Original body"}
-        mock_send = AsyncMock()
-        mock_lookup = AsyncMock(return_value=parent)
+        mock_send = create_autospec(classic_handler.outgoing_client.send_email)
+        mock_lookup = create_autospec(classic_handler.incoming_client._lookup_parent, return_value=parent)
 
         with (
             patch.object(classic_handler.outgoing_client, "send_email", mock_send),
@@ -367,8 +403,8 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_send_email_reply_parent_not_found(self, classic_handler):
         """No parent in any mailbox → body unchanged, new conversation root."""
-        mock_send = AsyncMock()
-        mock_lookup = AsyncMock(return_value=None)
+        mock_send = create_autospec(classic_handler.outgoing_client.send_email)
+        mock_lookup = create_autospec(classic_handler.incoming_client._lookup_parent, return_value=None)
 
         with (
             patch.object(classic_handler.outgoing_client, "send_email", mock_send),
@@ -424,7 +460,7 @@ class TestClassicEmailHandler:
             ),
         )
         handler = ClassicEmailHandler(email_settings)
-        mock_append = AsyncMock(return_value="42")
+        mock_append = create_autospec(handler.incoming_client.append_to_mailbox, return_value="42")
 
         with patch.object(handler.incoming_client, "append_to_mailbox", mock_append):
             result = await handler.save_to_mailbox(
@@ -440,7 +476,7 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_delete_emails(self, classic_handler):
         """Test delete_emails method."""
-        mock_delete = AsyncMock(return_value=(["123", "456"], []))
+        mock_delete = create_autospec(classic_handler.incoming_client.delete_emails, return_value=(["123", "456"], []))
 
         with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
             deleted_ids, failed_ids = await classic_handler.delete_emails(
@@ -457,7 +493,7 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_delete_emails_with_failures(self, classic_handler):
         """Test delete_emails method with some failures."""
-        mock_delete = AsyncMock(return_value=(["123"], ["456"]))
+        mock_delete = create_autospec(classic_handler.incoming_client.delete_emails, return_value=(["123"], ["456"]))
 
         with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
             deleted_ids, failed_ids = await classic_handler.delete_emails(
@@ -474,7 +510,7 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_delete_emails_custom_mailbox(self, classic_handler):
         """Test delete_emails method with custom mailbox."""
-        mock_delete = AsyncMock(return_value=(["789"], []))
+        mock_delete = create_autospec(classic_handler.incoming_client.delete_emails, return_value=(["789"], []))
 
         with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
             deleted_ids, failed_ids = await classic_handler.delete_emails(
@@ -489,7 +525,9 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read(self, classic_handler):
         """Test mark_emails_as_read method."""
-        mock_mark = AsyncMock(return_value=(["123", "456"], []))
+        mock_mark = create_autospec(
+            classic_handler.incoming_client.mark_emails_as_read, return_value=(["123", "456"], [])
+        )
 
         with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
             marked_ids, failed_ids = await classic_handler.mark_emails_as_read(
@@ -506,7 +544,9 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_with_failures(self, classic_handler):
         """Test mark_emails_as_read method with some failures."""
-        mock_mark = AsyncMock(return_value=(["123"], ["456"]))
+        mock_mark = create_autospec(
+            classic_handler.incoming_client.mark_emails_as_read, return_value=(["123"], ["456"])
+        )
 
         with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
             marked_ids, failed_ids = await classic_handler.mark_emails_as_read(
@@ -523,7 +563,7 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_custom_mailbox(self, classic_handler):
         """Test mark_emails_as_read method with custom mailbox."""
-        mock_mark = AsyncMock(return_value=(["789"], []))
+        mock_mark = create_autospec(classic_handler.incoming_client.mark_emails_as_read, return_value=(["789"], []))
 
         with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
             marked_ids, failed_ids = await classic_handler.mark_emails_as_read(
@@ -548,7 +588,7 @@ class TestClassicEmailHandler:
             "saved_path": save_path,
         }
 
-        mock_download = AsyncMock(return_value=mock_result)
+        mock_download = create_autospec(classic_handler.incoming_client.download_attachment, return_value=mock_result)
 
         with patch.object(classic_handler.incoming_client, "download_attachment", mock_download):
             result = await classic_handler.download_attachment(
@@ -569,11 +609,7 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_send_email_with_reply_headers(self, classic_handler):
         """Test sending email with reply headers."""
-        mock_smtp = AsyncMock()
-        mock_smtp.__aenter__.return_value = mock_smtp
-        mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
+        mock_smtp = _make_smtp_double()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
             await classic_handler.send_email(
@@ -592,11 +628,7 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_send_email_with_reply_to(self, classic_handler):
         """Test sending email with Reply-To header."""
-        mock_smtp = AsyncMock()
-        mock_smtp.__aenter__.return_value = mock_smtp
-        mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
-        mock_smtp.send_message = AsyncMock()
+        mock_smtp = _make_smtp_double()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
             await classic_handler.send_email(
@@ -628,7 +660,7 @@ class TestClassicEmailHandler:
         }
 
         # Mock the get_email_body_by_id method to return our test data
-        mock_get_body = AsyncMock(return_value=email_data)
+        mock_get_body = create_autospec(classic_handler.incoming_client.get_email_body_by_id, return_value=email_data)
 
         with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get_body):
             result = await classic_handler.get_emails_content(
@@ -668,7 +700,7 @@ class TestClassicEmailHandler:
             "attachments": [],
         }
 
-        mock_get_body = AsyncMock(return_value=email_data)
+        mock_get_body = create_autospec(classic_handler.incoming_client.get_email_body_by_id, return_value=email_data)
 
         with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get_body):
             result = await classic_handler.get_emails_content(
@@ -697,7 +729,7 @@ class TestClassicEmailHandler:
             "attachments": [],
         }
 
-        mock_get_body = AsyncMock(return_value=email_data)
+        mock_get_body = create_autospec(classic_handler.incoming_client.get_email_body_by_id, return_value=email_data)
 
         with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get_body):
             await classic_handler.get_emails_content(email_ids=["456"])
@@ -708,9 +740,9 @@ class TestClassicEmailHandler:
 
     @pytest.mark.asyncio
     async def test_get_emails_metadata_passes_allowlist_to_client(self, classic_handler):
-        mock_get = AsyncMock(return_value=(0, []))
+        mock_get = create_autospec(classic_handler.incoming_client.get_emails_metadata, return_value=(0, []))
         with patch(
-            "mcp_email_server.emails.classic.get_settings", return_value=MagicMock(allowed_senders=["*@example.com"])
+            "mcp_email_server.emails.classic.get_settings", return_value=_settings(allowed_senders=["*@example.com"])
         ):
             with patch.object(classic_handler.incoming_client, "get_emails_metadata", mock_get):
                 await classic_handler.get_emails_metadata(page=1, page_size=10)
@@ -718,18 +750,19 @@ class TestClassicEmailHandler:
 
     @pytest.mark.asyncio
     async def test_download_attachment_passes_allowlist_to_client(self, classic_handler):
-        mock_dl = AsyncMock(
+        mock_dl = create_autospec(
+            classic_handler.incoming_client.download_attachment,
             return_value={
                 "email_id": "1",
                 "attachment_name": "a.png",
                 "mime_type": "image/png",
                 "size": 3,
                 "saved_path": "/tmp/a.png",  # noqa: S108
-            }
+            },
         )
         with patch(
             "mcp_email_server.emails.classic.get_settings",
-            return_value=MagicMock(allowed_senders=["*@example.com"]),
+            return_value=_settings(allowed_senders=["*@example.com"]),
         ):
             with patch.object(classic_handler.incoming_client, "download_attachment", mock_dl):
                 await classic_handler.download_attachment("1", "a.png", "/tmp/a.png")  # noqa: S108
@@ -749,10 +782,10 @@ class TestClassicEmailHandler:
             "body": "x",
             "attachments": [],
         }
-        mock_get = AsyncMock(return_value=email_data)
+        mock_get = create_autospec(classic_handler.incoming_client.get_email_body_by_id, return_value=email_data)
         with patch(
             "mcp_email_server.emails.classic.get_settings",
-            return_value=MagicMock(allowed_senders=["*@example.com"]),
+            return_value=_settings(allowed_senders=["*@example.com"]),
         ):
             with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get):
                 await classic_handler.get_emails_content(["1"])
@@ -771,9 +804,9 @@ class TestClassicEmailHandler:
             "body": "x",
             "attachments": [],
         }
-        mock_get = AsyncMock(return_value=alice)
-        mock_mark = AsyncMock()
-        with patch("mcp_email_server.emails.classic.get_settings", return_value=MagicMock(allowed_senders=[])):
+        mock_get = create_autospec(classic_handler.incoming_client.get_email_body_by_id, return_value=alice)
+        mock_mark = create_autospec(classic_handler.incoming_client.mark_emails_as_read)
+        with patch("mcp_email_server.emails.classic.get_settings", return_value=_settings(allowed_senders=[])):
             with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get):
                 with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
                     result = await classic_handler.get_emails_content(["1"], mark_as_read=True)
@@ -783,10 +816,10 @@ class TestClassicEmailHandler:
 
     @pytest.mark.asyncio
     async def test_delete_emails_passes_allowlist_and_report_flag(self, classic_handler):
-        mock_delete = AsyncMock(return_value=(["1"], []))
+        mock_delete = create_autospec(classic_handler.incoming_client.delete_emails, return_value=(["1"], []))
         with patch(
             "mcp_email_server.emails.classic.get_settings",
-            return_value=MagicMock(allowed_senders=["*@example.com"], report_blocked_mutations=True),
+            return_value=_settings(allowed_senders=["*@example.com"], report_blocked_mutations=True),
         ):
             with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
                 await classic_handler.delete_emails(["1"], "INBOX")
@@ -795,10 +828,10 @@ class TestClassicEmailHandler:
 
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_passes_allowlist_and_report_flag(self, classic_handler):
-        mock_mark = AsyncMock(return_value=(["1"], []))
+        mock_mark = create_autospec(classic_handler.incoming_client.mark_emails_as_read, return_value=(["1"], []))
         with patch(
             "mcp_email_server.emails.classic.get_settings",
-            return_value=MagicMock(allowed_senders=["*@example.com"], report_blocked_mutations=False),
+            return_value=_settings(allowed_senders=["*@example.com"], report_blocked_mutations=False),
         ):
             with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
                 await classic_handler.mark_emails_as_read(["1"], "INBOX")
@@ -807,10 +840,10 @@ class TestClassicEmailHandler:
 
     @pytest.mark.asyncio
     async def test_move_emails_passes_allowlist_and_report_flag(self, classic_handler):
-        mock_move = AsyncMock(return_value=(["1"], []))
+        mock_move = create_autospec(classic_handler.incoming_client.move_emails, return_value=(["1"], []))
         with patch(
             "mcp_email_server.emails.classic.get_settings",
-            return_value=MagicMock(allowed_senders=["*@example.com"], report_blocked_mutations=True),
+            return_value=_settings(allowed_senders=["*@example.com"], report_blocked_mutations=True),
         ):
             with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
                 await classic_handler.move_emails(["1"], "INBOX", "Archive")
@@ -819,12 +852,16 @@ class TestClassicEmailHandler:
 
     @pytest.mark.asyncio
     async def test_archive_emails_passes_allowlist_and_report_flag(self, classic_handler):
-        mock_move = AsyncMock(return_value=(["1"], []))
+        mock_move = create_autospec(classic_handler.incoming_client.move_emails, return_value=(["1"], []))
         with patch(
             "mcp_email_server.emails.classic.get_settings",
-            return_value=MagicMock(allowed_senders=["*@example.com"], report_blocked_mutations=True),
+            return_value=_settings(allowed_senders=["*@example.com"], report_blocked_mutations=True),
         ):
-            with patch.object(classic_handler, "_find_archive_folder", AsyncMock(return_value="Archive")):
+            with patch.object(
+                classic_handler,
+                "_find_archive_folder",
+                create_autospec(classic_handler._find_archive_folder, return_value="Archive"),
+            ):
                 with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
                     await classic_handler.archive_emails(["1"], "INBOX")
         assert mock_move.call_args.kwargs.get("allowed_senders") == ["*@example.com"]
@@ -852,9 +889,9 @@ class TestEmailClientGetEmailBodyById:
     @pytest.mark.asyncio
     async def test_get_email_body_by_id_uses_peek_fetch_by_default(self, email_client, mock_imap):
         """Test default retrieval uses non-mutating PEEK fetch and does not STORE \\Seen."""
-        mock_imap.uid = AsyncMock(return_value=("OK", [b"FETCH BODY[]", bytearray(self._raw_email())]))
+        mock_imap.uid.return_value = ("OK", [b"FETCH BODY[]", bytearray(self._raw_email())])
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
             result = await email_client.get_email_body_by_id("123")
 
         assert result is not None
@@ -864,9 +901,9 @@ class TestEmailClientGetEmailBodyById:
     @pytest.mark.asyncio
     async def test_get_email_body_by_id_never_owns_mark_as_read_effect(self, email_client, mock_imap):
         """Even the compatibility argument leaves marking to the application service."""
-        mock_imap.uid = AsyncMock(return_value=("OK", [b"FETCH BODY[]", bytearray(self._raw_email())]))
+        mock_imap.uid.return_value = ("OK", [b"FETCH BODY[]", bytearray(self._raw_email())])
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
             result = await email_client.get_email_body_by_id("123", mark_as_read=True)
 
         assert result is not None
@@ -875,10 +912,10 @@ class TestEmailClientGetEmailBodyById:
     @pytest.mark.asyncio
     async def test_get_email_body_by_id_does_not_mark_as_read_when_parse_fails(self, email_client, mock_imap):
         """Test failed parsing skips the \\Seen STORE side effect."""
-        mock_imap.uid = AsyncMock(return_value=("OK", [b"FETCH BODY[]", bytearray(self._raw_email())]))
+        mock_imap.uid.return_value = ("OK", [b"FETCH BODY[]", bytearray(self._raw_email())])
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            with patch.object(email_client, "_parse_email_data", side_effect=ValueError("parse failed")):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
+            with patch.object(email_client, "_parse_email_data", autospec=True, side_effect=ValueError("parse failed")):
                 result = await email_client.get_email_body_by_id("123", mark_as_read=True)
 
         assert result is None
@@ -887,9 +924,11 @@ class TestEmailClientGetEmailBodyById:
     @pytest.mark.asyncio
     async def test_get_email_body_by_id_blocked_sender_returns_none_without_reading_body(self, email_client, mock_imap):
         """A blocked sender returns None and the body is never fetched (From is checked first)."""
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            with patch.object(email_client, "_batch_fetch_senders", return_value={"123": "bob@evil.com"}):
-                with patch.object(email_client, "_fetch_email_with_formats", new=AsyncMock()) as mock_body:
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
+            with patch.object(
+                email_client, "_batch_fetch_senders", autospec=True, return_value={"123": "bob@evil.com"}
+            ):
+                with patch.object(email_client, "_fetch_email_with_formats", autospec=True) as mock_body:
                     result = await email_client.get_email_body_by_id("123", allowed_senders=["alice@example.com"])
 
         assert result is None
@@ -898,10 +937,12 @@ class TestEmailClientGetEmailBodyById:
     @pytest.mark.asyncio
     async def test_get_email_body_by_id_allowed_sender_reads_body(self, email_client, mock_imap):
         """An allowed sender passes the From check and the body is fetched."""
-        mock_imap.uid = AsyncMock(return_value=("OK", [b"FETCH BODY[]", bytearray(self._raw_email())]))
+        mock_imap.uid.return_value = ("OK", [b"FETCH BODY[]", bytearray(self._raw_email())])
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            with patch.object(email_client, "_batch_fetch_senders", return_value={"123": "sender@example.com"}):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
+            with patch.object(
+                email_client, "_batch_fetch_senders", autospec=True, return_value={"123": "sender@example.com"}
+            ):
                 result = await email_client.get_email_body_by_id("123", allowed_senders=["*@example.com"])
 
         assert result is not None
@@ -910,10 +951,10 @@ class TestEmailClientGetEmailBodyById:
     @pytest.mark.asyncio
     async def test_get_email_body_by_id_no_allowlist_skips_sender_check(self, email_client, mock_imap):
         """With no allowlist configured, the From header is not pre-fetched (zero overhead)."""
-        mock_imap.uid = AsyncMock(return_value=("OK", [b"FETCH BODY[]", bytearray(self._raw_email())]))
+        mock_imap.uid.return_value = ("OK", [b"FETCH BODY[]", bytearray(self._raw_email())])
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            with patch.object(email_client, "_batch_fetch_senders") as mock_senders:
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
+            with patch.object(email_client, "_batch_fetch_senders", autospec=True) as mock_senders:
                 result = await email_client.get_email_body_by_id("123")
 
         assert result is not None
@@ -930,9 +971,9 @@ class TestEmailClientMarkAsRead:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_success(self, email_client, mock_imap):
         """Test marking emails as read sets \\Seen flag via IMAP STORE."""
-        mock_imap.uid = AsyncMock(return_value=("OK", [b"1 STORE +FLAGS (\\Seen)"]))
+        mock_imap.uid.return_value = ("OK", [b"1 STORE +FLAGS (\\Seen)"])
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
             marked_ids, failed_ids = await email_client.mark_emails_as_read(["123", "456"])
 
         assert marked_ids == ["123", "456"]
@@ -945,9 +986,9 @@ class TestEmailClientMarkAsRead:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_partial_failure(self, email_client, mock_imap):
         """Test marking emails handles partial failures gracefully."""
-        mock_imap.uid = AsyncMock(side_effect=[("OK", []), Exception("IMAP error")])
+        mock_imap.uid.side_effect = [("OK", []), Exception("IMAP error")]
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
             marked_ids, failed_ids = await email_client.mark_emails_as_read(["123", "456"])
 
         assert marked_ids == ["123"]
@@ -956,9 +997,9 @@ class TestEmailClientMarkAsRead:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_treats_no_response_as_failure(self, email_client, mock_imap):
         """Test IMAP NO STORE responses are reported as failed ids."""
-        mock_imap.uid = AsyncMock(return_value=("NO", [b"STORE failed"]))
+        mock_imap.uid.return_value = ("NO", [b"STORE failed"])
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
             marked_ids, failed_ids = await email_client.mark_emails_as_read(["123"])
 
         assert marked_ids == []
@@ -967,9 +1008,9 @@ class TestEmailClientMarkAsRead:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_raises_on_select_failure(self, email_client, mock_imap):
         """Test mailbox selection failures are surfaced."""
-        mock_imap.select = AsyncMock(return_value=("NO", [b"unknown mailbox"]))
+        mock_imap.select.return_value = ("NO", [b"unknown mailbox"])
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
             with pytest.raises(RuntimeError, match="SELECT mailbox Archive failed"):
                 await email_client.mark_emails_as_read(["123"], mailbox="Archive")
 
@@ -978,9 +1019,9 @@ class TestEmailClientMarkAsRead:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_custom_mailbox(self, email_client, mock_imap):
         """Test marking emails in a custom mailbox."""
-        mock_imap.uid = AsyncMock(return_value=("OK", []))
+        mock_imap.uid.return_value = ("OK", [])
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
             await email_client.mark_emails_as_read(["123"], mailbox="Archive")
 
         mock_imap.select.assert_called_once()
@@ -991,9 +1032,9 @@ class TestEmailClientMarkAsRead:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_logout_on_error(self, email_client, mock_imap):
         """Test that IMAP logout is called even when errors occur."""
-        mock_imap.login = AsyncMock(side_effect=Exception("auth failed"))
+        mock_imap.login.side_effect = Exception("auth failed")
 
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
             with pytest.raises(ConnectionError, match=r"IMAP login failed \(TRANSPORT\)"):
                 await email_client.mark_emails_as_read(["123"])
 
@@ -1002,7 +1043,7 @@ class TestEmailClientMarkAsRead:
     @pytest.mark.asyncio
     async def test_mark_emails_as_read_empty_list(self, email_client, mock_imap):
         """Test marking empty list returns empty results."""
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", autospec=True, return_value=mock_imap):
             marked_ids, failed_ids = await email_client.mark_emails_as_read([])
 
         assert marked_ids == []
@@ -1061,7 +1102,7 @@ Subject: No Date Email
     @pytest.mark.asyncio
     async def test_batch_fetch_dates_empty_list(self, email_client):
         """Test _batch_fetch_dates with empty list returns empty dict."""
-        mock_imap = AsyncMock()
+        mock_imap = _make_imap_double()
         result = await email_client._batch_fetch_dates(mock_imap, [])
 
         assert result == {}
@@ -1070,7 +1111,7 @@ Subject: No Date Email
     @pytest.mark.asyncio
     async def test_batch_fetch_headers_empty_list(self, email_client):
         """Test _batch_fetch_headers with empty list returns empty dict."""
-        mock_imap = AsyncMock()
+        mock_imap = _make_imap_double()
         result = await email_client._batch_fetch_headers(mock_imap, [])
 
         assert result == {}
@@ -1079,7 +1120,7 @@ Subject: No Date Email
     @pytest.mark.asyncio
     async def test_batch_fetch_dates_parses_response(self, email_client):
         """Test _batch_fetch_dates correctly parses IMAP INTERNALDATE response."""
-        mock_imap = AsyncMock()
+        mock_imap = _make_imap_double()
         # Simulate IMAP response format for INTERNALDATE
         mock_imap.uid.return_value = (
             "OK",
@@ -1099,7 +1140,7 @@ Subject: No Date Email
     @pytest.mark.asyncio
     async def test_batch_fetch_headers_parses_response(self, email_client):
         """Test _batch_fetch_headers correctly parses IMAP BODY[HEADER] response."""
-        mock_imap = AsyncMock()
+        mock_imap = _make_imap_double()
         # Simulate IMAP response format for BODY[HEADER]
         mock_imap.uid.return_value = (
             "OK",
@@ -1121,8 +1162,8 @@ class TestGetEmailsContentEdgeCases:
     @pytest.mark.asyncio
     async def test_none_email_data_goes_to_failed_ids(self, classic_handler):
         """A fetch that returns None is reported as a genuine failure."""
-        mock_get = AsyncMock(return_value=None)
-        with patch("mcp_email_server.emails.classic.get_settings", return_value=MagicMock(allowed_senders=[])):
+        mock_get = create_autospec(classic_handler.incoming_client.get_email_body_by_id, return_value=None)
+        with patch("mcp_email_server.emails.classic.get_settings", return_value=_settings(allowed_senders=[])):
             with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get):
                 result = await classic_handler.get_emails_content(["1"])
         assert result.emails == []
@@ -1132,8 +1173,8 @@ class TestGetEmailsContentEdgeCases:
     @pytest.mark.asyncio
     async def test_fetch_exception_goes_to_failed_ids(self, classic_handler):
         """An exception during fetch is caught and reported as a failure, not raised."""
-        mock_get = AsyncMock(side_effect=Exception("boom"))
-        with patch("mcp_email_server.emails.classic.get_settings", return_value=MagicMock(allowed_senders=[])):
+        mock_get = create_autospec(classic_handler.incoming_client.get_email_body_by_id, side_effect=Exception("boom"))
+        with patch("mcp_email_server.emails.classic.get_settings", return_value=_settings(allowed_senders=[])):
             with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get):
                 result = await classic_handler.get_emails_content(["1"])
         assert result.failed_ids == ["1"]
@@ -1153,8 +1194,8 @@ class TestGetEmailsContentEdgeCases:
             "body": "x",
             "attachments": [],
         }
-        mock_get = AsyncMock(return_value=email_data)
-        with patch("mcp_email_server.emails.classic.get_settings", return_value=MagicMock(allowed_senders=[])):
+        mock_get = create_autospec(classic_handler.incoming_client.get_email_body_by_id, return_value=email_data)
+        with patch("mcp_email_server.emails.classic.get_settings", return_value=_settings(allowed_senders=[])):
             with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get):
                 result = await classic_handler.get_emails_content(["1"], mark_as_read=True)
         assert result.retrieved_count == 1
