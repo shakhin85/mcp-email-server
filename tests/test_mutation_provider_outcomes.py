@@ -29,7 +29,28 @@ def _imap(*, capabilities: tuple[str, ...] = ("IMAP4rev1", "UIDPLUS")) -> AsyncM
     imap.list.return_value = ("OK", [])
     imap.logout.return_value = ("BYE", [])
     imap.protocol = SimpleNamespace(capabilities=capabilities, capability=AsyncMock())
+    handshake = asyncio.get_running_loop().create_future()
+    handshake.set_result(None)
+    imap._client_task = handshake
     return imap
+
+
+@contextmanager
+def _scripted_imap(client: EmailClient, imap: AsyncMock) -> Iterator[None]:
+    """Route the client's connection factory to a scripted server (real greeting/prepare path)."""
+    client.imap_class = lambda *_args, **_kwargs: imap
+    yield
+
+
+@contextmanager
+def _scripted_imap_server(imap: AsyncMock) -> Iterator[None]:
+    """Route the static connection factory to a scripted server at the aioimaplib class boundary."""
+    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4_SSL", return_value=imap):
+        yield
+
+
+def _list_line(attributes: str, name: str) -> bytes:
+    return f'({attributes}) "/" "{name}"'.encode()
 
 
 @pytest.mark.asyncio
@@ -37,7 +58,7 @@ async def test_mark_read_transport_loss_is_unknown(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap()
     imap.uid.side_effect = ConnectionError("lost after write")
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.mark_emails_as_read_with_outcome(["8"], allowed_senders=[])
 
     assert result.outcomes[0].status == "unknown"
@@ -50,7 +71,7 @@ async def test_mark_read_explicit_rejection_is_failed(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap()
     imap.uid.return_value = ("NO", [b"provider detail must not escape"])
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.mark_emails_as_read_with_outcome(["8"], allowed_senders=[])
 
     assert result.outcomes[0].status == "failed"
@@ -62,7 +83,7 @@ async def test_mark_read_disconnect_response_is_unknown(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap()
     imap.uid.return_value = ("BYE", [])
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.mark_emails_as_read_with_outcome(["8"], allowed_senders=[])
 
     assert (result.outcomes[0].status, result.outcomes[0].detail) == ("unknown", "store-unknown")
@@ -72,7 +93,7 @@ async def test_mark_read_disconnect_response_is_unknown(email_server) -> None:
 async def test_set_email_flags_removes_multiple_flags_with_silent_store(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap()
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.set_email_flags_with_outcome(
             ["8", "9"],
             "remove",
@@ -114,19 +135,17 @@ async def test_set_email_flags_rejects_invalid_contract_before_connect(
     message: str,
 ) -> None:
     client = EmailClient(email_server)
-    connect = AsyncMock()
+    connect = MagicMock()
+    client.imap_class = connect
 
-    with (
-        patch.object(client, "_connect_imap", connect),
-        pytest.raises(ValueError, match=message),
-    ):
+    with pytest.raises(ValueError, match=message):
         await client.set_email_flags_with_outcome(
             ["8"],
             cast(FlagOperation, operation),
             cast(list[MutableEmailFlag], flags),
         )
 
-    connect.assert_not_awaited()
+    connect.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -134,7 +153,7 @@ async def test_delete_store_disconnect_response_is_unknown_and_stops_before_expu
     client = EmailClient(email_server)
     imap = _imap()
     imap.uid.return_value = ("BYE", [])
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.delete_emails_with_outcome(["8"], allowed_senders=[])
 
     assert (result.outcomes[0].status, result.outcomes[0].detail) == ("unknown", "store-unknown")
@@ -150,7 +169,7 @@ async def test_delete_expunge_rejection_is_unknown_after_store(email_server) -> 
         return ("NO", []) if command == "expunge" else ("OK", [])
 
     imap.uid.side_effect = uid
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.delete_emails_with_outcome(["8"], allowed_senders=[])
 
     assert result.outcomes[0].status == "unknown"
@@ -167,7 +186,7 @@ async def test_delete_expunge_disconnect_response_is_unknown_not_rejected(email_
         return ("BYE", []) if command == "expunge" else ("OK", [])
 
     imap.uid.side_effect = uid
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.delete_emails_with_outcome(["8"], allowed_senders=[])
 
     assert (result.outcomes[0].status, result.outcomes[0].detail) == ("unknown", "expunge-unknown")
@@ -177,7 +196,7 @@ async def test_delete_expunge_disconnect_response_is_unknown_not_rejected(email_
 async def test_delete_without_uidplus_fails_before_store(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap(capabilities=("IMAP4rev1",))
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.delete_emails_with_outcome(["8"], allowed_senders=[])
 
     assert result.outcomes[0].status == "failed"
@@ -194,7 +213,7 @@ async def test_move_fallback_store_rejection_preserves_partial_fact_as_unknown(e
         return ("NO", []) if command == "store" else ("OK", [])
 
     imap.uid.side_effect = uid
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.move_emails_with_outcome(["8"], "INBOX", "Archive", allowed_senders=[])
 
     assert result.outcomes[0].status == "unknown"
@@ -207,7 +226,7 @@ async def test_native_move_transport_loss_is_unknown(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap(capabilities=("IMAP4rev1", "UIDPLUS", "MOVE"))
     imap.uid.side_effect = ConnectionError("result lost")
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.move_emails_with_outcome(["8"], "INBOX", "Archive", allowed_senders=[])
 
     assert result.outcomes[0].status == "unknown"
@@ -220,7 +239,7 @@ async def test_native_move_disconnect_response_is_unknown(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap(capabilities=("IMAP4rev1", "UIDPLUS", "MOVE"))
     imap.uid.return_value = ("BYE", [])
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.move_emails_with_outcome(["8"], "INBOX", "Archive", allowed_senders=[])
 
     assert (result.outcomes[0].status, result.outcomes[0].detail) == ("unknown", "move-unknown")
@@ -231,7 +250,7 @@ async def test_move_fallback_copy_disconnect_response_is_unknown_and_stops_uid(e
     client = EmailClient(email_server)
     imap = _imap()
     imap.uid.return_value = ("BYE", [])
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.move_emails_with_outcome(["8"], "INBOX", "Archive", allowed_senders=[])
 
     assert (result.outcomes[0].status, result.outcomes[0].detail) == ("unknown", "copy-unknown")
@@ -243,7 +262,7 @@ async def test_move_fallback_store_disconnect_preserves_copy_as_unknown(email_se
     client = EmailClient(email_server)
     imap = _imap()
     imap.uid.side_effect = [("OK", []), ("BYE", [])]
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.move_emails_with_outcome(["8"], "INBOX", "Archive", allowed_senders=[])
 
     assert (result.outcomes[0].status, result.outcomes[0].detail) == (
@@ -259,7 +278,7 @@ async def test_append_transport_loss_is_unknown_and_not_replayed(email_server) -
     message = client.compose_message(["recipient@example.test"], "Draft", "body")
     imap = _imap()
     imap.append.side_effect = ConnectionError("result lost")
-    with patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)):
+    with _scripted_imap_server(imap):
         result = await client.append_to_mailbox_with_outcome(message, email_server, "Drafts")
 
     assert result.status == "unknown"
@@ -274,7 +293,7 @@ async def test_append_disconnect_response_is_unknown_not_retriable_failure(email
     message = client.compose_message(["recipient@example.test"], "Draft", "body")
     imap = _imap()
     imap.append.return_value = ("BYE", [])
-    with patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)):
+    with _scripted_imap_server(imap):
         result = await client.append_to_mailbox_with_outcome(message, email_server, "Drafts")
 
     assert (result.status, result.detail) == ("unknown", "append-unknown")
@@ -285,7 +304,7 @@ async def test_append_success_without_appenduid_does_not_invent_uid(email_server
     client = EmailClient(email_server)
     message = client.compose_message(["recipient@example.test"], "Draft", "body")
     imap = _imap()
-    with patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)):
+    with _scripted_imap_server(imap):
         result = await client.append_to_mailbox_with_outcome(message, email_server, "Drafts")
 
     assert result.status == "succeeded"
@@ -298,7 +317,7 @@ async def test_sent_copy_transport_loss_stops_after_one_append(email_server) -> 
     message = client.compose_message(["recipient@example.test"], "Sent", "body")
     imap = _imap()
     imap.append.side_effect = ConnectionError("result lost")
-    with patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)):
+    with _scripted_imap_server(imap):
         result = await client.append_to_sent_with_outcome(message, email_server, "Sent")
 
     assert result.status == "unknown"
@@ -313,7 +332,7 @@ async def test_sent_copy_disconnect_response_is_unknown_and_not_replayed(email_s
     message = client.compose_message(["recipient@example.test"], "Sent", "body")
     imap = _imap()
     imap.append.return_value = ("BYE", [])
-    with patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)):
+    with _scripted_imap_server(imap):
         result = await client.append_to_sent_with_outcome(message, email_server, "Sent")
 
     assert (result.status, result.mailbox, result.detail) == ("unknown", "Sent", "append-unknown")
@@ -331,7 +350,7 @@ async def test_all_imap_append_paths_serialize_messages_with_crlf(email_server, 
     message["Message-Id"] = "<line-endings@example.test>"
     imap = _imap()
 
-    with patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)):
+    with _scripted_imap_server(imap):
         if operation == "mailbox-outcome":
             await client.append_to_mailbox_with_outcome(message, email_server, "Drafts")
         elif operation == "sent-outcome":
@@ -512,7 +531,7 @@ async def test_mark_read_cancellation_preserves_partial_batch_and_stops(email_se
     client = EmailClient(email_server)
     imap = _imap()
     imap.uid.side_effect = [("OK", []), asyncio.CancelledError()]
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.mark_emails_as_read_with_outcome(["7", "8", "9"], allowed_senders=[])
 
     assert [(item.status, item.detail) for item in result.outcomes] == [
@@ -528,7 +547,7 @@ async def test_native_move_cancellation_is_unknown_and_stops_batch(email_server)
     client = EmailClient(email_server)
     imap = _imap(capabilities=("IMAP4rev1", "UIDPLUS", "MOVE"))
     imap.uid.side_effect = asyncio.CancelledError()
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.move_emails_with_outcome(["8", "9"], "INBOX", "Archive", allowed_senders=[])
 
     assert [(item.status, item.detail) for item in result.outcomes] == [
@@ -543,7 +562,7 @@ async def test_move_fallback_store_cancellation_preserves_copy_and_stops(email_s
     client = EmailClient(email_server)
     imap = _imap()
     imap.uid.side_effect = [("OK", []), asyncio.CancelledError()]
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.move_emails_with_outcome(["8", "9"], "INBOX", "Archive", allowed_senders=[])
 
     assert [(item.status, item.detail) for item in result.outcomes] == [
@@ -558,7 +577,7 @@ async def test_delete_expunge_cancellation_is_unknown_after_store(email_server) 
     client = EmailClient(email_server)
     imap = _imap()
     imap.uid.side_effect = [("OK", []), asyncio.CancelledError()]
-    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+    with _scripted_imap(client, imap):
         result = await client.delete_emails_with_outcome(["8"], allowed_senders=[])
 
     assert [(item.status, item.detail) for item in result.outcomes] == [("unknown", "expunge-unknown")]
@@ -572,7 +591,7 @@ async def test_append_cancellation_is_unknown_and_logout_cancellation_does_not_e
     imap = _imap()
     imap.append.side_effect = asyncio.CancelledError()
     imap.logout.side_effect = asyncio.CancelledError()
-    with patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)):
+    with _scripted_imap_server(imap):
         result = await client.append_to_mailbox_with_outcome(message, email_server, "Drafts")
 
     assert (result.status, result.detail) == ("unknown", "append-unknown")
@@ -585,7 +604,7 @@ async def test_sent_copy_append_cancellation_is_unknown_and_not_replayed(email_s
     message = client.compose_message(["recipient@example.test"], "Sent", "body")
     imap = _imap()
     imap.append.side_effect = asyncio.CancelledError()
-    with patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)):
+    with _scripted_imap_server(imap):
         result = await client.append_to_sent_with_outcome(message, email_server, "Sent")
 
     assert (result.status, result.mailbox, result.detail) == ("unknown", "Sent", "append-unknown")
@@ -598,10 +617,8 @@ async def test_sent_copy_ignores_invalid_provider_derived_mailbox(email_server) 
     client = EmailClient(email_server)
     message = client.compose_message(["recipient@example.test"], "Sent", "body")
     imap = _imap()
-    with (
-        patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)),
-        patch.object(client, "_find_folder_by_flag", AsyncMock(return_value="Bad\r\nMailbox")),
-    ):
+    imap.list.return_value = ("OK", [_list_line(r"\HasNoChildren \Sent", "Bad\r\nMailbox")])
+    with _scripted_imap_server(imap):
         result = await client.append_to_sent_with_outcome(message, email_server)
 
     assert result.status == "succeeded"
@@ -615,7 +632,7 @@ async def test_append_ignores_malformed_appenduid_evidence(email_server) -> None
     message = client.compose_message(["recipient@example.test"], "Draft", "body")
     imap = _imap()
     imap.append.return_value = ("OK", [b"[APPENDUID 123 7suffix] completed"])
-    with patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)):
+    with _scripted_imap_server(imap):
         result = await client.append_to_mailbox_with_outcome(message, email_server, "Drafts")
 
     assert result.status == "succeeded"
@@ -957,16 +974,14 @@ async def test_append_without_mailbox_uses_drafts_special_use_folder(email_serve
     client = EmailClient(email_server)
     message = client.compose_message(["recipient@example.test"], "Draft", "body")
     imap = _imap()
-    find = AsyncMock(return_value=flag_folder)
-    with (
-        patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)),
-        patch.object(client, "_find_folder_by_flag", find),
-    ):
+    if flag_folder is not None:
+        imap.list.return_value = ("OK", [_list_line(r"\HasNoChildren \Drafts", flag_folder)])
+    with _scripted_imap_server(imap):
         result = await client.append_to_mailbox_with_outcome(message, email_server, None)
 
     assert (result.status, result.mailbox) == ("succeeded", expected)
     assert imap.select.await_args.args == (f'"{expected}"',)
-    assert find.await_args.args[1] == r"\Drafts"
+    imap.list.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -974,12 +989,9 @@ async def test_append_with_explicit_mailbox_skips_special_use_lookup(email_serve
     client = EmailClient(email_server)
     message = client.compose_message(["recipient@example.test"], "Draft", "body")
     imap = _imap()
-    find = AsyncMock(return_value="Brouillons")
-    with (
-        patch.object(client, "_connect_imap_server", AsyncMock(return_value=imap)),
-        patch.object(client, "_find_folder_by_flag", find),
-    ):
+    imap.list.return_value = ("OK", [_list_line(r"\HasNoChildren \Drafts", "Brouillons")])
+    with _scripted_imap_server(imap):
         result = await client.append_to_mailbox_with_outcome(message, email_server, "Templates")
 
     assert result.mailbox == "Templates"
-    find.assert_not_awaited()
+    imap.list.assert_not_awaited()
