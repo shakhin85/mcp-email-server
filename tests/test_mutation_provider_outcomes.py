@@ -6,7 +6,11 @@ import re
 import ssl
 from collections.abc import Iterator
 from contextlib import contextmanager
+from email.message import Message
 from email.mime.text import MIMEText
+from email.parser import BytesParser
+from email.policy import SMTP as SMTP_POLICY
+from email.policy import compat32
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,7 +20,7 @@ from aiosmtplib.errors import SMTPNotSupported, SMTPRecipientRefused, SMTPRespon
 from loguru import logger
 
 from mcp_email_server.application.mutations import FlagOperation, MutableEmailFlag
-from mcp_email_server.emails.classic import EmailClient, _smtp_error_category
+from mcp_email_server.emails.classic import EmailClient, _classify_smtp_data_transport, _smtp_error_category
 
 
 def _imap(*, capabilities: tuple[str, ...] = ("IMAP4rev1", "UIDPLUS")) -> AsyncMock:
@@ -28,7 +32,7 @@ def _imap(*, capabilities: tuple[str, ...] = ("IMAP4rev1", "UIDPLUS")) -> AsyncM
     imap.append.return_value = ("OK", [])
     imap.list.return_value = ("OK", [])
     imap.logout.return_value = ("BYE", [])
-    imap.protocol = SimpleNamespace(capabilities=capabilities, capability=AsyncMock())
+    imap.protocol = SimpleNamespace(capabilities=capabilities, capability=AsyncMock(), transport=None)
     handshake = asyncio.get_running_loop().create_future()
     handshake.set_result(None)
     imap._client_task = handshake
@@ -108,6 +112,50 @@ async def test_set_email_flags_removes_multiple_flags_with_silent_store(email_se
         ("store", "9", "-FLAGS.SILENT", r"(\Seen \Flagged)"),
     ]
     imap.select.assert_awaited_once_with('"Archive"')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "store_operation"),
+    [("add", "+FLAGS.SILENT"), ("remove", "-FLAGS.SILENT")],
+)
+async def test_set_email_tags_adds_or_removes_keywords_with_silent_store(
+    email_server,
+    operation: str,
+    store_operation: str,
+) -> None:
+    client = EmailClient(email_server)
+    imap = _imap()
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        result = await client.set_email_tags_with_outcome(
+            ["8", "9"],
+            cast(FlagOperation, operation),
+            ["$label4"],
+            "Archive",
+            [],
+            False,
+        )
+
+    assert result.targets("succeeded") == ["8", "9"]
+    assert [call.args for call in imap.uid.await_args_list] == [
+        ("store", "8", store_operation, "($label4)"),
+        ("store", "9", store_operation, "($label4)"),
+    ]
+    imap.select.assert_awaited_once_with('"Archive"')
+
+
+@pytest.mark.asyncio
+async def test_set_email_tags_rejects_empty_tags_before_connect(email_server) -> None:
+    client = EmailClient(email_server)
+    connect = AsyncMock()
+
+    with (
+        patch.object(client, "_connect_imap", connect),
+        pytest.raises(ValueError, match="tags must contain between 1 and"),
+    ):
+        await client.set_email_tags_with_outcome(["8"], "add", [], "INBOX", [], False)
+
+    connect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -376,6 +424,234 @@ def _smtp() -> AsyncMock:
     return smtp
 
 
+def _smtp_message(content_transfer_encoding: str | None, payload: bytes) -> Message:
+    transfer_header = (
+        b""
+        if content_transfer_encoding is None
+        else f"Content-Transfer-Encoding: {content_transfer_encoding}\r\n".encode("ascii")
+    )
+    raw_message = (
+        b"From: sender@example.test\r\n"
+        b"To: recipient@example.test\r\n"
+        b"Subject: Subject\r\n"
+        b"Content-Type: application/octet-stream\r\n" + transfer_header + b"\r\n" + payload + b"\r\n"
+    )
+    return BytesParser(policy=compat32).parsebytes(raw_message)
+
+
+@pytest.mark.parametrize(
+    ("content_transfer_encoding", "payload", "expected"),
+    (
+        ("7bit", b"ASCII payload", "7bit"),
+        ("8bit", b"ASCII payload", "7bit"),
+        ("8bit", b"caf\xe9", "8bit"),
+        ("binary", b"ASCII payload", "binary"),
+        ("8bit", b"ASCII\x00payload", "binary"),
+        ("8bit", b"a" * 998, "7bit"),
+        ("8bit", b"a" * 999, "binary"),
+        (None, b"caf\xe9", "invalid"),
+        ("7bit", b"caf\xe9", "invalid"),
+        ("base64", b"caf\xe9", "invalid"),
+        ("quoted-printable", b"caf\xe9", "invalid"),
+    ),
+)
+def test_smtp_data_transport_classification(
+    content_transfer_encoding: str | None,
+    payload: bytes,
+    expected: str,
+) -> None:
+    message = _smtp_message(content_transfer_encoding, payload)
+
+    assert _classify_smtp_data_transport(message, message.as_bytes(policy=SMTP_POLICY)) == expected
+
+
+def test_smtp_data_transport_finds_nested_binary_leaf() -> None:
+    message = BytesParser(policy=compat32).parsebytes(
+        b"Content-Type: multipart/mixed; boundary=outer\r\n"
+        b"\r\n"
+        b"--outer\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b"Content-Transfer-Encoding: binary\r\n"
+        b"\r\n"
+        b"ASCII payload\r\n"
+        b"--outer--\r\n"
+    )
+
+    assert _classify_smtp_data_transport(message, message.as_bytes(policy=SMTP_POLICY)) == "binary"
+
+
+@pytest.mark.parametrize(
+    ("outer_transfer_encoding", "expected"),
+    ((None, "invalid"), ("7bit", "invalid"), ("8bit", "8bit"), ("base64", "invalid")),
+)
+def test_smtp_data_transport_enforces_composite_cte_domain(
+    outer_transfer_encoding: str | None,
+    expected: str,
+) -> None:
+    transfer_header = (
+        b""
+        if outer_transfer_encoding is None
+        else f"Content-Transfer-Encoding: {outer_transfer_encoding}\r\n".encode("ascii")
+    )
+    message = BytesParser(policy=compat32).parsebytes(
+        b"Content-Type: multipart/mixed; boundary=outer\r\n" + transfer_header + b"\r\n"
+        b"--outer\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Transfer-Encoding: 8bit\r\n"
+        b"\r\n"
+        b"caf\xe9\r\n"
+        b"--outer--\r\n"
+    )
+
+    assert _classify_smtp_data_transport(message, message.as_bytes(policy=SMTP_POLICY)) == expected
+
+
+@pytest.mark.asyncio
+async def test_smtp_raw_8bit_requires_extension_before_mail(email_server) -> None:
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    message = _smtp_message("8bit", b"caf\xe9")
+    smtp = _smtp()
+
+    with (
+        patch.object(client, "compose_message", return_value=message),
+        patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp),
+    ):
+        result = await client.send_email_with_outcome(["recipient@example.test"], "Subject", "body")
+
+    assert [(item.status, item.detail) for item in result.outcomes] == [("failed", "smtp-8bitmime-required")]
+    assert result.sent_message is None
+    smtp.mail.assert_not_awaited()
+    smtp.rcpt.assert_not_awaited()
+    smtp.data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_smtp_raw_8bit_uses_advertised_extension(email_server) -> None:
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    message = _smtp_message("8bit", b"caf\xe9")
+    message["Reply-To"] = "回复@example.test"
+    smtp = _smtp()
+    advertised = {"8bitmime", "size", "smtputf8"}
+    smtp.supports_extension = MagicMock(side_effect=lambda name: name.casefold() in advertised)
+
+    with (
+        patch.object(client, "compose_message", return_value=message),
+        patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp),
+    ):
+        result = await client.send_email_with_outcome(["recipient@example.test"], "Subject", "body")
+
+    assert [(item.status, item.detail) for item in result.outcomes] == [("succeeded", None)]
+    message_bytes = smtp.data.await_args.args[0]
+    smtp.mail.assert_awaited_once_with(
+        "sender@example.test",
+        options=[f"SIZE={len(message_bytes)}", "SMTPUTF8", "BODY=8BITMIME"],
+        encoding="utf-8",
+    )
+    assert b"caf\xe9" in message_bytes
+
+
+@pytest.mark.asyncio
+async def test_smtp_7bit_message_does_not_request_8bitmime_only_because_it_is_advertised(email_server) -> None:
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    smtp = _smtp()
+    smtp.supports_extension = MagicMock(side_effect=lambda name: name.casefold() == "8bitmime")
+
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        result = await client.send_email_with_outcome(["recipient@example.test"], "Subject", "body")
+
+    assert [(item.status, item.detail) for item in result.outcomes] == [("succeeded", None)]
+    smtp.mail.assert_awaited_once_with("sender@example.test", options=[], encoding="ascii")
+    assert smtp.data.await_args.args[0].isascii()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_transfer_encoding", (None, "7bit", "base64", "quoted-printable"))
+async def test_smtp_mislabeled_raw_8bit_is_rejected_for_every_recipient_before_mail(
+    email_server,
+    content_transfer_encoding: str | None,
+) -> None:
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    message = _smtp_message(content_transfer_encoding, b"caf\xe9")
+    smtp = _smtp()
+    smtp.supports_extension = MagicMock(side_effect=lambda name: name.casefold() == "8bitmime")
+
+    with (
+        patch.object(client, "compose_message", return_value=message),
+        patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp),
+    ):
+        result = await client.send_email_with_outcome(
+            ["to@example.test"],
+            "Subject",
+            "body",
+            cc=["cc@example.test"],
+            bcc=["bcc@example.test"],
+        )
+
+    assert [(item.target, item.status, item.detail) for item in result.outcomes] == [
+        ("to@example.test", "failed", "smtp-mime-transport-invalid"),
+        ("cc@example.test", "failed", "smtp-mime-transport-invalid"),
+        ("bcc@example.test", "failed", "smtp-mime-transport-invalid"),
+    ]
+    smtp.mail.assert_not_awaited()
+    smtp.rcpt.assert_not_awaited()
+    smtp.data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_transfer_encoding", "payload"),
+    (
+        ("binary", b"ASCII payload"),
+        ("8bit", b"ASCII\x00payload"),
+        ("8bit", b"a" * 999),
+    ),
+)
+async def test_smtp_binary_data_is_rejected_before_mail_even_with_8bitmime(
+    email_server,
+    content_transfer_encoding: str,
+    payload: bytes,
+) -> None:
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    message = _smtp_message(content_transfer_encoding, payload)
+    smtp = _smtp()
+    advertised = {"8bitmime", "binarymime", "chunking"}
+    smtp.supports_extension = MagicMock(side_effect=lambda name: name.casefold() in advertised)
+
+    with (
+        patch.object(client, "compose_message", return_value=message),
+        patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp),
+    ):
+        result = await client.send_email_with_outcome(["recipient@example.test"], "Subject", "body")
+
+    assert [(item.status, item.detail) for item in result.outcomes] == [("failed", "smtp-binarymime-unsupported")]
+    assert result.sent_message is None
+    smtp.mail.assert_not_awaited()
+    smtp.rcpt.assert_not_awaited()
+    smtp.data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bare_line_ending", (b"\n", b"\r"))
+async def test_smtp_bare_line_ending_is_rejected_before_mail(email_server, bare_line_ending: bytes) -> None:
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    message = _smtp_message("8bit", b"ASCII payload")
+    replacement = b"ASCII" + bare_line_ending + b"payload\r\n"
+    message_bytes = message.as_bytes(policy=SMTP_POLICY).replace(b"ASCII payload\r\n", replacement)
+    smtp = _smtp()
+
+    with (
+        patch.object(client, "compose_message", return_value=message),
+        patch.object(message, "as_bytes", return_value=message_bytes),
+        patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp),
+    ):
+        result = await client.send_email_with_outcome(["recipient@example.test"], "Subject", "body")
+
+    assert [(item.status, item.detail) for item in result.outcomes] == [("failed", "smtp-binarymime-unsupported")]
+    smtp.mail.assert_not_awaited()
+    smtp.rcpt.assert_not_awaited()
+    smtp.data.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_smtp_uses_addr_spec_for_envelope_and_quoted_display_name_for_header(email_server) -> None:
     client = EmailClient(
@@ -419,6 +695,36 @@ async def test_smtp_partial_recipient_rejection_is_preserved(email_server) -> No
     assert smtp.rcpt.await_count == 2
     smtp.data.assert_awaited_once()
     assert b"Bcc:" not in smtp.data.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_smtp_accepted_data_reports_the_delivered_message_id(email_server) -> None:
+    """The composed Message-Id is the only handle a caller has on what was actually delivered."""
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    smtp = _smtp()
+
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        result = await client.send_email_with_outcome(["one@example.test"], "Subject", "body")
+
+    assert [item.status for item in result.outcomes] == ["succeeded"]
+    assert result.message_id is not None
+    assert re.fullmatch(r"<[^<>@\s]+@[^<>@\s]+>", result.message_id)
+    assert f"Message-Id: {result.message_id}".encode() in smtp.data.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_smtp_data_transport_loss_reports_no_message_id(email_server) -> None:
+    """A lost DATA result leaves delivery unknown, so no identifier may be claimed for it."""
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    smtp = _smtp()
+    smtp.data.side_effect = ConnectionError("result lost")
+
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        result = await client.send_email_with_outcome(["one@example.test"], "Subject", "body")
+
+    assert [item.status for item in result.outcomes] == ["unknown"]
+    assert result.sent_message is None
+    assert result.message_id is None
 
 
 @pytest.mark.asyncio
@@ -995,3 +1301,146 @@ async def test_append_with_explicit_mailbox_skips_special_use_lookup(email_serve
 
     assert result.mailbox == "Templates"
     imap.list.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("interrupted_command", "detail"),
+    [("copy", "copy-unknown"), ("store", "copy-succeeded-store-unknown"), ("expunge", "expunge-after-copy-unknown")],
+)
+@pytest.mark.asyncio
+async def test_move_fallback_real_timeout_preserves_completed_prefix(email_server, interrupted_command, detail):
+    client = EmailClient(email_server)
+    imap = _imap()
+    imap.protocol.transport = MagicMock()
+    calls = []
+
+    async def uid(command, uid, *_args):
+        calls.append((command, uid))
+        if uid == "8" and command == interrupted_command:
+            await asyncio.Event().wait()
+        return ("OK", [])
+
+    imap.uid.side_effect = uid
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        async with asyncio.timeout(0.05):
+            result = await client.move_emails_with_outcome(["7", "8", "9"], "INBOX", "Archive", allowed_senders=[])
+
+    assert [(x.target, x.status, x.detail) for x in result.outcomes] == [
+        ("7", "succeeded", None),
+        ("8", "unknown", detail),
+        ("9", "failed", "not-attempted"),
+    ]
+    assert calls[:3] == [("copy", "7"), ("store", "7"), ("expunge", "7")]
+    assert calls[-1] == (interrupted_command, "8")
+    assert not any(uid == "9" for _, uid in calls)
+    imap.protocol.transport.close.assert_called_once()
+    imap.logout.assert_not_awaited()
+    assert result.reconciliation_needed
+
+
+@pytest.mark.parametrize(
+    ("rejected_command", "status", "detail"),
+    [
+        ("copy", "failed", "copy-rejected"),
+        ("store", "unknown", "copy-succeeded-store-failed"),
+        ("expunge", "unknown", "expunge-after-copy-failed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_move_fallback_rejection_preserves_prefix_and_continues(email_server, rejected_command, status, detail):
+    client = EmailClient(email_server)
+    imap = _imap()
+    calls = []
+
+    async def uid(command, uid, *_args):
+        calls.append((command, uid))
+        return ("NO", []) if uid == "8" and command == rejected_command else ("OK", [])
+
+    imap.uid.side_effect = uid
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        result = await client.move_emails_with_outcome(["7", "8", "9"], "INBOX", "Archive", allowed_senders=[])
+
+    assert [(x.status, x.detail) for x in result.outcomes] == [
+        ("succeeded", None),
+        (status, detail),
+        ("succeeded", None),
+    ]
+    assert calls[:3] == [("copy", "7"), ("store", "7"), ("expunge", "7")]
+    assert calls[-3:] == [("copy", "9"), ("store", "9"), ("expunge", "9")]
+    assert len([call for call in calls if call == (rejected_command, "8")]) == 1
+    imap.expunge.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("interrupted_command", "detail"),
+    [("copy", "copy-unknown"), ("store", "copy-succeeded-store-unknown"), ("expunge", "expunge-after-copy-unknown")],
+)
+@pytest.mark.asyncio
+async def test_move_fallback_unknown_response_stops_after_completed_prefix(email_server, interrupted_command, detail):
+    client = EmailClient(email_server)
+    imap = _imap()
+    imap.protocol.transport = MagicMock()
+    calls = []
+
+    async def uid(command, uid, *_args):
+        calls.append((command, uid))
+        return ("BYE", []) if uid == "8" and command == interrupted_command else ("OK", [])
+
+    imap.uid.side_effect = uid
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        result = await client.move_emails_with_outcome(["7", "8", "9"], "INBOX", "Archive", allowed_senders=[])
+
+    assert [(x.target, x.status, x.detail) for x in result.outcomes] == [
+        ("7", "succeeded", None),
+        ("8", "unknown", detail),
+        ("9", "failed", "not-attempted"),
+    ]
+    assert calls[:3] == [("copy", "7"), ("store", "7"), ("expunge", "7")]
+    assert calls[-1] == (interrupted_command, "8")
+    assert not any(uid == "9" for _, uid in calls)
+    imap.protocol.transport.close.assert_called_once()
+    imap.logout.assert_not_awaited()
+    assert result.reconciliation_needed
+
+
+@pytest.mark.parametrize("cleanup", ["abort", "logout"])
+@pytest.mark.asyncio
+async def test_move_fallback_cleanup_cancellation_preserves_evidence(email_server, cleanup):
+    client = EmailClient(email_server)
+    imap = _imap()
+    if cleanup == "abort":
+        imap.uid.side_effect = [("OK", []), ("OK", []), ("OK", []), asyncio.CancelledError()]
+    else:
+        imap.logout.side_effect = asyncio.CancelledError()
+    with (
+        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
+        patch.object(client, "_abort_imap_connection", AsyncMock(side_effect=asyncio.CancelledError())),
+    ):
+        result = await client.move_emails_with_outcome(["7", "8"], "INBOX", "Archive", allowed_senders=[])
+    assert result.outcomes[0].status == "succeeded"
+    assert result.outcomes[1].status == ("unknown" if cleanup == "abort" else "succeeded")
+    if cleanup == "abort":
+        imap.logout.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_move_fallback_revocation_after_successful_prefix(email_server):
+    client = EmailClient(email_server)
+    client.mutation_guard = MagicMock(
+        side_effect=[None, None, None, None, None, PermissionError("revoked"), PermissionError("revoked")]
+    )
+    imap = _imap()
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        result = await client.move_emails_with_outcome(["7", "8", "9"], "INBOX", "Archive", allowed_senders=[])
+    assert [(x.status, x.detail) for x in result.outcomes] == [
+        ("succeeded", None),
+        ("unknown", "mutation-policy-cleanup-pending"),
+        ("failed", "mutation-policy"),
+    ]
+    assert [(c.args[0], c.args[1]) for c in imap.uid.await_args_list] == [
+        ("copy", "7"),
+        ("store", "7"),
+        ("expunge", "7"),
+        ("copy", "8"),
+        ("store", "8"),
+    ]

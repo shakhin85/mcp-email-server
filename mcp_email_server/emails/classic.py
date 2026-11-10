@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email import encoders
 from email.header import Header
 from email.headerregistry import Address, AddressHeader
@@ -25,11 +25,11 @@ from email.mime.text import MIMEText
 from email.parser import BytesParser
 from email.policy import SMTP as SMTP_POLICY
 from email.policy import SMTPUTF8 as SMTPUTF8_POLICY
-from email.policy import default
+from email.policy import compat32, default
 from html import escape as escape_html
 from itertools import pairwise
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import aioimaplib
 import aiosmtplib
@@ -42,13 +42,21 @@ from aiosmtplib.errors import (
 )
 from bs4 import BeautifulSoup
 
-from mcp_email_server.application.limits import APPLICATION_LIMITS, validate_imap_uid
+from mcp_email_server.application.limits import (
+    APPLICATION_LIMITS,
+    metadata_header_budget_bytes,
+    metadata_refresh_batch_limit,
+    metadata_refresh_timeout_seconds,
+    metadata_snapshot_row_limit,
+    validate_imap_uid,
+)
 from mcp_email_server.application.metadata import (
-    MAX_METADATA_SNAPSHOT_ROWS,
     MailboxMetadataSnapshot,
     MailboxState,
+    MailboxUidDelta,
     MetadataProviderObservationError,
     MetadataQueryTooBroadError,
+    normalize_datetime_boundary,
 )
 from mcp_email_server.application.mutations import (
     MUTABLE_EMAIL_FLAGS,
@@ -56,14 +64,24 @@ from mcp_email_server.application.mutations import (
     BatchMutationOutcome,
     DeliveryMutationOutcome,
     FlagOperation,
+    MailboxCreationStatus,
     MutableEmailFlag,
     MutationStatus,
     SentCopyMutationOutcome,
     TargetMutationOutcome,
+    normalize_thread_message_ids,
     validate_mailbox_name,
 )
-from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
-from mcp_email_server.emails import EmailHandler
+from mcp_email_server.config import (
+    EmailServer,
+    EmailSettings,
+    ImapNonAsciiSearchEncoding,
+    ImapNonAsciiSearchMode,
+    get_settings,
+    resolve_imap_non_ascii_search,
+    sender_allowed,
+)
+from mcp_email_server.emails import EmailHandler, charsets
 from mcp_email_server.emails.account_format import apply_account_format
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
@@ -73,20 +91,31 @@ from mcp_email_server.emails.models import (
     EmailMetadataPageResponse,
     MailboxInfo,
 )
-from mcp_email_server.log import logger
+from mcp_email_server.log import log_safe_failure, logger
+
+# GB2312 labels decode as GB18030, including in encoded-word headers (see charsets).
+charsets.install_gb2312_superset_aliases()
 
 # Maximum body length before truncation (characters)
 MAX_BODY_LENGTH = 20000
 MAX_METADATA_CANDIDATES = APPLICATION_LIMITS.metadata_candidates
-MAX_INDEXED_UID_WINDOW = MAX_METADATA_SNAPSHOT_ROWS
+# Historical default. Runtime refreshes call metadata_snapshot_row_limit().
+MAX_INDEXED_UID_WINDOW = APPLICATION_LIMITS.metadata_snapshot_rows
 MAX_METADATA_HEADER_BYTES = APPLICATION_LIMITS.header_bytes
 MAX_METADATA_HEADER_TOTAL_BYTES = APPLICATION_LIMITS.aggregate_header_bytes
 MAX_METADATA_HEADER_FETCH_UIDS = MAX_METADATA_HEADER_TOTAL_BYTES // (MAX_METADATA_HEADER_BYTES + 1)
 MAX_IMAP_UID = 2**32 - 1
+_MAILBOX_STATE_NOTICES: set[str] = set()
 MAX_METADATA_UID_SEARCH_BYTES = MAX_METADATA_CANDIDATES * 11
 MAX_ATTACHMENT_BYTES = APPLICATION_LIMITS.attachment_bytes
 MAX_TOTAL_ATTACHMENT_BYTES = APPLICATION_LIMITS.total_attachment_bytes
 MAX_RAW_EMAIL_BYTES = MAX_TOTAL_ATTACHMENT_BYTES
+# One character encodes to at least one UTF-8 byte, so a parse window one wider than
+# the compose byte limit guarantees any truncated forward body already exceeds that
+# limit and is rejected by application validation instead of being sent shortened.
+FORWARD_SOURCE_BODY_WINDOW = APPLICATION_LIMITS.body_bytes + 1
+SmtpDataTransport = Literal["7bit", "8bit", "binary", "invalid"]
+_HIGH_BIT_OCTET = re.compile(rb"[\x80-\xff]")
 
 
 def _addresses_for_header(message: Message, field_name: str) -> list[Address]:
@@ -117,6 +146,80 @@ def _message_requires_smtputf8(message: Message) -> bool:
     )
 
 
+def _normalized_content_transfer_encoding(part: Message) -> str:
+    """Return one MIME transfer-encoding token with ordinary comments removed."""
+    value = str(part.get("Content-Transfer-Encoding", "7bit"))
+    while True:
+        without_comments = re.sub(r"\([^()]*\)", "", value)
+        if without_comments == value:
+            return value.strip().casefold()
+        value = without_comments
+
+
+def _leaf_payload_has_high_bit(part: Message) -> bool:
+    """Return whether one unencoded leaf payload contains non-ASCII data."""
+    payload = part.get_payload()
+    if isinstance(payload, str):
+        return not payload.isascii()
+    if isinstance(payload, bytes):
+        return not payload.isascii()
+    return False
+
+
+def _classify_mime_entity_transport(part: Message) -> SmtpDataTransport:
+    """Classify one MIME entity while enforcing its recursive CTE domain."""
+    transfer_encoding = _normalized_content_transfer_encoding(part)
+    if transfer_encoding == "binary":
+        return "binary"
+    if part.get_content_maintype() in ("multipart", "message") and transfer_encoding not in (
+        "7bit",
+        "8bit",
+        "binary",
+    ):
+        return "invalid"
+    if part.is_multipart():
+        child_transports = tuple(
+            _classify_mime_entity_transport(child) for child in part.get_payload() if isinstance(child, Message)
+        )
+        if "binary" in child_transports:
+            return "binary"
+        if "invalid" in child_transports:
+            return "invalid"
+        if "8bit" in child_transports:
+            return "8bit" if transfer_encoding == "8bit" else "invalid"
+        return "7bit"
+    if _leaf_payload_has_high_bit(part):
+        return "8bit" if transfer_encoding == "8bit" else "invalid"
+    return "7bit"
+
+
+def _classify_smtp_data_transport(message: Message, message_bytes: bytes) -> SmtpDataTransport:
+    """Classify the transport required by one fully serialized SMTP DATA payload.
+
+    SMTP ``DATA`` remains line-oriented even when the server advertises
+    ``8BITMIME``. A binary transfer encoding, NUL, bare line ending, or line over
+    the RFC 5321 limit therefore requires a binary submission path that this
+    client does not implement. Raw high-bit leaf payloads are valid only with an
+    ``8bit`` MIME transfer encoding; a capability cannot repair a mismatched CTE.
+    """
+    mime_transport = _classify_mime_entity_transport(message)
+    if mime_transport in ("binary", "invalid"):
+        return mime_transport
+    if (
+        b"\x00" in message_bytes
+        or re.search(rb"(?<!\r)\n|\r(?!\n)", message_bytes) is not None
+        or re.search(rb"[^\r\n]{999}", message_bytes) is not None
+    ):
+        return "binary"
+    body_start = message_bytes.find(b"\r\n\r\n")
+    if body_start < 0:
+        return "binary"
+    body_has_high_bit = _HIGH_BIT_OCTET.search(message_bytes, body_start + 4) is not None
+    if body_has_high_bit and mime_transport != "8bit":
+        return "invalid"
+    return "8bit" if body_has_high_bit else "7bit"
+
+
 def _serialize_message_for_imap_append(message: Message, *, utf8: bool | None = None) -> bytes:
     """Serialize one IMAP APPEND payload with RFC-compliant CRLF line endings."""
     requires_utf8 = _message_requires_smtputf8(message) if utf8 is None else utf8
@@ -139,6 +242,67 @@ def _first_thread_header(message: Message, name: str) -> str | None:
         return None
     normalized = re.sub(r"[ \t]+", " ", str(values[0])).strip()
     return normalized or None
+
+
+def normalize_forwarded_part(part: Message) -> Message:
+    """Return a compat32 copy of one source MIME part, safe to attach to a compat32 container.
+
+    ``forward_email`` parses the source message with ``BytesParser(policy=default)``,
+    which yields ``EmailMessage`` sub-parts whose headers are *structured* objects.
+    ``compose_message`` builds legacy ``MIMEMultipart``/``MIMEText`` containers, and the
+    send paths flatten them under several different policies (``SMTP``, ``SMTPUTF8``,
+    ``compat32`` for the IMAP Sent copy, plus aiosmtplib's own re-flatten). A structured
+    header re-serialized under ``SMTPUTF8`` emits raw UTF-8 parameter values; when that
+    output is re-parsed and flattened again under ``SMTP`` the original RFC 2231 charset
+    is lost and the parameter is re-encoded as ``unknown-8bit``. Round-tripping the part
+    through ``compat32`` freezes every header as an opaque string, so all send paths
+    emit byte-identical part headers.
+
+    Payload bytes are carried verbatim, including the two cases a naive truthiness check
+    drops: a zero-byte attachment (``get_payload(decode=True)`` returns ``b""``) and a
+    ``message/rfc822`` part (returns ``None``).
+
+    Known trade-off: the initial ``policy=default`` serialization re-folds any header
+    parameter a non-conformant source stored as raw 8-bit octets (an unencoded
+    ``filename="café.pdf"``) into RFC 2231 ``unknown-8bit`` form before the freeze.
+    That representation is standard-conformant and identical on every send path, but
+    it is not byte-identical to the source header; conformant RFC 2231/2047
+    parameters round-trip untouched.
+    """
+    return BytesParser(policy=compat32).parsebytes(part.as_bytes())
+
+
+def _strip_to_content_headers(part: Message) -> Message:
+    """Return a compat32 copy of one part carrying only its MIME content headers.
+
+    A single-part source whose top level IS the attachment (root Content-Disposition:
+    attachment) would otherwise be re-attached whole — envelope headers included —
+    leaking the source's Received/DKIM/Message-ID chain, and the Bcc header a Sent-copy
+    source carries, into the outgoing forward as a malformed body part.
+    """
+    clone = BytesParser(policy=compat32).parsebytes(part.as_bytes())
+    for name in list(clone.keys()):
+        if not name.lower().startswith("content-"):
+            del clone[name]
+    return clone
+
+
+def _format_forwarded_text(sender: str, recipients: Sequence[str], date: str, subject: str, body: str) -> str:
+    """Build the plain-text forwarded-message block quoted below the caller's note.
+
+    An empty ``date`` omits the line: a source without a Date header must not have
+    a composed-at timestamp fabricated as its provenance.
+    """
+    header = (
+        "---------- Forwarded message ----------\n"
+        f"From: {sender}\n"
+        # Neutral label: the parsed recipient list folds in Cc, so "To:" would mislead.
+        f"Recipients: {', '.join(recipients)}\n"
+    )
+    if date:
+        header += f"Date: {date}\n"
+    header += f"Subject: {subject}\n"
+    return f"{header}\n{body}"
 
 
 class _LiteralSearchCommand(aioimaplib.Command):
@@ -211,15 +375,50 @@ class ImapUtf8UnsupportedError(RuntimeError):
 
 
 class _MetadataHeaderBudget:
-    def __init__(self) -> None:
+    def __init__(self, *, aggregate_bytes: int | None = None) -> None:
         self.total_bytes = 0
+        self._aggregate_bytes = metadata_header_budget_bytes() if aggregate_bytes is None else aggregate_bytes
 
     def add(self, raw_headers: bytes) -> None:
         if len(raw_headers) > MAX_METADATA_HEADER_BYTES:
             raise MetadataPayloadTooLargeError("provider_payload_too_large: metadata header exceeds 64 KiB")
         self.total_bytes += len(raw_headers)
-        if self.total_bytes > MAX_METADATA_HEADER_TOTAL_BYTES:
-            raise MetadataPayloadTooLargeError("provider_payload_too_large: metadata header query exceeds 4 MiB")
+        if self.total_bytes > self._aggregate_bytes:
+            if self._aggregate_bytes == APPLICATION_LIMITS.aggregate_header_bytes:
+                limit_text = "4 MiB"
+            else:
+                limit_text = f"{self._aggregate_bytes} bytes"
+            raise MetadataPayloadTooLargeError(
+                f"provider_payload_too_large: metadata header query exceeds {limit_text}"
+            )
+
+
+def _header_fetch_uid_limit() -> int:
+    """How many maximum-size headers fit in the current aggregate budget."""
+
+    return max(1, metadata_header_budget_bytes() // (MAX_METADATA_HEADER_BYTES + 1))
+
+
+def _metadata_refresh_batches(uids: list[str], batch_size: int) -> list[list[str]]:
+    return [uids[index : index + batch_size] for index in range(0, len(uids), batch_size)]
+
+
+def _retained_snapshot_rows(
+    rows: Sequence[dict[str, Any]] | None,
+    *,
+    allowed: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Keep already stored rows that still belong in the newest UID window."""
+
+    retained: dict[str, dict[str, Any]] = {}
+    for row in rows or ():
+        uid = row.get("email_id")
+        if not isinstance(uid, str) or uid not in allowed or uid in retained:
+            continue
+        if not isinstance(row.get("_internal_date"), datetime) or not isinstance(row.get("date"), datetime):
+            continue
+        retained[uid] = dict(row)
+    return retained
 
 
 # aioimaplib's protocol-level CAPABILITY command has no built-in timeout.
@@ -227,6 +426,7 @@ _IMAP_CAPABILITY_TIMEOUT_SECONDS = 30.0
 
 # Common Archive folder names, used as a fallback when no RFC 6154 \Archive flag is found.
 _ARCHIVE_FOLDER_CANDIDATES = ("Archive", "Archives", "[Gmail]/All Mail")
+_JUNK_FOLDER_CANDIDATES = ("Junk", "Spam", "[Gmail]/Spam", "Junk E-mail", "Junk Email")
 
 
 # RFC 3501 atoms exclude controls and these protocol-special characters.
@@ -258,6 +458,12 @@ def _is_valid_imap_flag(flag: str) -> bool:
     """Accept RFC 3501 flag-keyword and flag-extension atoms."""
     atom = flag[1:] if flag.startswith("\\") else flag
     return _is_imap_atom(atom)
+
+
+def _quote_imap_search_text(value: str) -> str:
+    """Return one IMAP quoted string with exact backslash and quote escaping."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _is_imap_astring(value: str) -> bool:
@@ -503,14 +709,64 @@ def _quote_mailbox(mailbox: str, *, utf8: bool = False) -> str:
     return f'"{escaped}"'
 
 
+def _notice_mailbox_state(key: str, message: str) -> None:
+    """Log one process-wide INFO line for an omitted mailbox-state field."""
+
+    if key in _MAILBOX_STATE_NOTICES:
+        return
+    _MAILBOX_STATE_NOTICES.add(key)
+    logger.info(message)
+
+
+def _uid_belongs_to_epoch(email: dict[str, Any], uidnext: int | None) -> bool:
+    """Return whether one row's UID fits the observed allocation counter.
+
+    A missing UIDNEXT does not invent ``max(uid) + 1``. Any positive UID inside
+    the IMAP range is then eligible, including values separated by expunge gaps.
+    """
+
+    raw_uid = email.get("email_id")
+    if not isinstance(raw_uid, str) or not raw_uid.isdigit():
+        return False
+    uid = int(raw_uid)
+    if uid <= 0 or uid > MAX_IMAP_UID:
+        return False
+    return uidnext is None or uid < uidnext
+
+
+def _observation_identity_changed(before: MailboxState, after: MailboxState) -> bool:
+    """Return whether two observations lack a shared provider UIDVALIDITY.
+
+    ``None`` is not an epoch. A mailbox reset can reissue the same UID numbers,
+    so a missing UIDVALIDITY never matches another observation.
+    """
+
+    if before.uidvalidity is None or after.uidvalidity is None:
+        return True
+    return before.uidvalidity != after.uidvalidity
+
+
+def _same_provider_epoch(retained_uidvalidity: int | None, state: MailboxState) -> bool:
+    """Reuse retained rows only inside one observed UIDVALIDITY value."""
+
+    return state.uidvalidity is not None and retained_uidvalidity == state.uidvalidity
+
+
 def _uid_sort_key(uid: bytes | str) -> int:
     """Return a numeric sort key for already validated IMAP UIDs."""
     value = uid.decode() if isinstance(uid, bytes) else uid
     return int(value)
 
 
-def _normalize_search_uids(messages: Any) -> list[str]:  # noqa: C901 - bounded provider UID validation
+def _normalize_search_uids(  # noqa: C901 - bounded provider UID validation
+    messages: Any,
+    *,
+    maximum_uids: int = MAX_METADATA_CANDIDATES,
+) -> list[str]:
     """Return canonical single UIDs from one bounded UID SEARCH payload."""
+    if maximum_uids < 1:
+        raise ValueError("Metadata UID search limit is invalid")
+    maximum_bytes = maximum_uids * (MAX_METADATA_UID_SEARCH_BYTES // MAX_METADATA_CANDIDATES)
     if not isinstance(messages, list | tuple) or not messages or not messages[0]:
         return []
     # aioimaplib places the UID SEARCH payload first and may retain a tagged
@@ -518,22 +774,27 @@ def _normalize_search_uids(messages: Any) -> list[str]:  # noqa: C901 - bounded 
     # UID set under this adapter contract.
     payload = messages[0]
     if isinstance(payload, bytes):
-        if len(payload) > MAX_METADATA_UID_SEARCH_BYTES:
-            raise MetadataQueryTooBroadError(
-                f"query_too_broad: metadata search exceeded {MAX_METADATA_CANDIDATES} candidate UIDs"
-            )
+        if len(payload) > maximum_bytes:
+            raise MetadataQueryTooBroadError(f"query_too_broad: metadata search exceeded {maximum_uids} candidate UIDs")
         try:
             text = payload.decode("ascii")
         except UnicodeDecodeError as exc:
             raise MetadataProviderObservationError("Provider returned invalid UID search results") from exc
     elif isinstance(payload, str):
-        if len(payload.encode("utf-8")) > MAX_METADATA_UID_SEARCH_BYTES:
-            raise MetadataQueryTooBroadError(
-                f"query_too_broad: metadata search exceeded {MAX_METADATA_CANDIDATES} candidate UIDs"
-            )
+        if len(payload.encode("utf-8")) > maximum_bytes:
+            raise MetadataQueryTooBroadError(f"query_too_broad: metadata search exceeded {maximum_uids} candidate UIDs")
         text = payload
     else:
         raise MetadataProviderObservationError("Provider returned invalid UID search results")
+
+    # iCloud omits the untagged `* SEARCH` line when a search has no matches.
+    # aioimaplib then exposes only the tagged completion text in `lines`, while
+    # compliant empty responses contain an empty payload before that text.
+    # Recognize only the observed completion-only format; all other non-UID
+    # payloads remain provider observation failures.
+    if len(messages) == 1 and re.fullmatch(r"SEARCH completed \(took [0-9]+ ms\)", text, flags=re.IGNORECASE):
+        logger.debug("Provider omitted the empty UID SEARCH payload; treating the successful search as empty")
+        return []
 
     result: list[str] = []
     seen: set[str] = set()
@@ -545,10 +806,8 @@ def _normalize_search_uids(messages: Any) -> list[str]:  # noqa: C901 - bounded 
             raise MetadataProviderObservationError("Provider returned invalid UID search results")
         seen.add(token)
         result.append(token)
-    if len(result) > MAX_METADATA_CANDIDATES:
-        raise MetadataQueryTooBroadError(
-            f"query_too_broad: metadata search exceeded {MAX_METADATA_CANDIDATES} candidate UIDs"
-        )
+    if len(result) > maximum_uids:
+        raise MetadataQueryTooBroadError(f"query_too_broad: metadata search exceeded {maximum_uids} candidate UIDs")
     return result
 
 
@@ -572,6 +831,58 @@ def _imap_effect_status(response: Any) -> MutationStatus:
     if status in {"NO", "BAD"}:
         return "failed"
     return "unknown"
+
+
+def _has_already_exists_code(response: Any) -> bool:
+    """Detect the RFC 5530 ALREADYEXISTS response code without exposing server text."""
+    lines = response[1] if isinstance(response, tuple | list) and len(response) > 1 else getattr(response, "lines", ())
+    for line in lines or ():
+        text = line.decode("utf-8", "replace") if isinstance(line, bytes | bytearray) else str(line)
+        if text.lstrip().upper().startswith("[ALREADYEXISTS]"):
+            return True
+    return False
+
+
+def _discard_metadata_imap(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
+    """Release a metadata connection whose command boundary is uncertain."""
+    protocol = imap.protocol
+    if protocol is not None:
+        if isinstance(protocol, aioimaplib.IMAP4ClientProtocol):
+            commands = list(protocol.pending_async_commands.values())
+            if protocol.pending_sync_command is not None:
+                commands.append(protocol.pending_sync_command)
+            if protocol.current_command is not None:
+                commands.append(protocol.current_command)
+            for command in commands:
+                command.close(b"Connection discarded", "KO")
+            protocol.pending_async_commands.clear()
+            protocol.pending_sync_command = None
+            protocol.current_command = None
+            protocol.incomplete_line = b""
+        transport = protocol.transport
+        if isinstance(transport, asyncio.BaseTransport):
+            with suppress(Exception):
+                if isinstance(transport, asyncio.WriteTransport):
+                    transport.abort()
+                else:
+                    transport.close()
+        imap.protocol = None
+
+
+async def _close_metadata_imap(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL, *, discard: bool = False) -> None:
+    """Bound graceful logout and always release the underlying transport."""
+    if discard:
+        _discard_metadata_imap(imap)
+        return
+    if imap.protocol is None:
+        return
+    try:
+        async with asyncio.timeout(APPLICATION_LIMITS.provider_timeout_seconds):
+            await imap.logout()
+    except Exception:
+        logger.info("IMAP logout failed")
+    finally:
+        _discard_metadata_imap(imap)
 
 
 async def _best_effort_imap_logout(imap: Any) -> None:
@@ -923,10 +1234,17 @@ async def _uid_search(
     imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL,
     criteria: Sequence[ImapSearchToken],
 ) -> Any:
-    """Use the convenience path for ASCII and literals for international text."""
+    """Use synchronizing literals, quoted UTF-8, or ASCII atoms as encoded.
+
+    ASCII criteria omit CHARSET so Exchange stays on the #178 path. Non-ASCII
+    literals use the #230 continuation framing. Quoted non-ASCII strings are sent
+    through aioimaplib with ``CHARSET UTF-8`` because some servers, notably QQ
+    Mail, mis-parse the synchronizing-literal form.
+    """
     if any(isinstance(token, _ImapSearchLiteral) for token in criteria):
         return await _uid_search_with_literals(imap, criteria)
-    return await imap.uid_search(*(cast(str, token) for token in criteria), charset=None)
+    charset = "UTF-8" if any(isinstance(token, str) and not token.isascii() for token in criteria) else None
+    return await imap.uid_search(*(cast(str, token) for token in criteria), charset=charset)
 
 
 async def _imap_login(
@@ -963,13 +1281,12 @@ async def _imap_login(
 
 
 def _smtp_utf8_mail_options(smtp: aiosmtplib.SMTP) -> list[str]:
-    """Return legacy-send ESMTP options or reject before MAIL."""
+    """Return RFC 6531 legacy-send options or reject before MAIL."""
     if not smtp.supports_extension("smtputf8"):
         raise SMTPNotSupported("SMTPUTF8 is not supported by this server")
-    options = ["SMTPUTF8"]
-    if smtp.supports_extension("8bitmime"):
-        options.append("BODY=8BITMIME")
-    return options
+    if not smtp.supports_extension("8bitmime"):
+        raise SMTPNotSupported("8BITMIME is required by SMTPUTF8")
+    return ["SMTPUTF8", "BODY=8BITMIME"]
 
 
 def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
@@ -1191,8 +1508,11 @@ class EmailClient:
         *,
         sender_name: str | None = None,
         sender_address: str | None = None,
+        imap_non_ascii_search: ImapNonAsciiSearchMode | None = None,
     ):
+        self.mutation_guard: Callable[[], None] | None = None
         self.email_server = email_server
+        self.imap_non_ascii_search: ImapNonAsciiSearchMode | None = imap_non_ascii_search
         raw_sender = sender or email_server.user_name
         if sender_name is not None and sender_address is not None:
             self.sender_name = sender_name
@@ -1220,6 +1540,14 @@ class EmailClient:
         self.smtp_start_tls = self.email_server.start_ssl
         self.smtp_verify_ssl = self.email_server.verify_ssl
 
+    def _check_mutation_authority(self) -> None:
+        if self.mutation_guard is not None:
+            self.mutation_guard()
+
+    def _non_ascii_search_encoding(self) -> ImapNonAsciiSearchEncoding:
+        """Choose literal or quoted non-ASCII SEARCH text for this account."""
+        return resolve_imap_non_ascii_search(self.email_server.host, self.imap_non_ascii_search)
+
     @property
     def envelope_sender(self) -> str:
         """Return the RFC 5321 reverse-path address for outbound operations."""
@@ -1227,8 +1555,10 @@ class EmailClient:
             raise ValueError("sender must contain one email address")
         return self.sender_address
 
-    def _imap_connect(self) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
+    def _imap_connect(self, *, timeout: float | None = None) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
         """Create a new IMAP connection with the configured SSL context."""
+        if timeout is None:
+            timeout = APPLICATION_LIMITS.provider_timeout_seconds
         if self.email_server.use_ssl:
             imap_ssl_context = _create_ssl_context(self.email_server.verify_ssl)
             if imap_ssl_context is not None:
@@ -1236,12 +1566,13 @@ class EmailClient:
                     self.email_server.host,
                     self.email_server.port,
                     ssl_context=imap_ssl_context,
+                    timeout=timeout,
                 )
-        return self.imap_class(self.email_server.host, self.email_server.port)
+        return self.imap_class(self.email_server.host, self.email_server.port, timeout=timeout)
 
-    async def _connect_imap(self) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
+    async def _connect_imap(self, *, timeout: float | None = None) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
         """Create, greet, and optionally STARTTLS-upgrade an IMAP connection."""
-        imap = self._imap_connect()
+        imap = self._imap_connect(timeout=timeout)
         return await self._prepare_imap_connection(imap, self.email_server)
 
     @staticmethod
@@ -1283,11 +1614,18 @@ class EmailClient:
         if server.use_ssl:
             imap_ssl_context = _create_ssl_context(server.verify_ssl)
             if imap_ssl_context is None:
-                imap = aioimaplib.IMAP4_SSL(server.host, server.port)
+                imap = aioimaplib.IMAP4_SSL(
+                    server.host, server.port, timeout=APPLICATION_LIMITS.provider_timeout_seconds
+                )
             else:
-                imap = aioimaplib.IMAP4_SSL(server.host, server.port, ssl_context=imap_ssl_context)
+                imap = aioimaplib.IMAP4_SSL(
+                    server.host,
+                    server.port,
+                    ssl_context=imap_ssl_context,
+                    timeout=APPLICATION_LIMITS.provider_timeout_seconds,
+                )
         else:
-            imap = aioimaplib.IMAP4(server.host, server.port)
+            imap = aioimaplib.IMAP4(server.host, server.port, timeout=APPLICATION_LIMITS.provider_timeout_seconds)
 
         return await EmailClient._prepare_imap_connection(imap, server)
 
@@ -1296,16 +1634,25 @@ class EmailClient:
         return _create_ssl_context(self.smtp_verify_ssl)
 
     @staticmethod
+    def _parse_address_field(email_message: Message, field_name: str) -> list[str]:
+        """Extract one canonical mailbox from a single RFC 5322 address field."""
+
+        return [str(address) for address in _addresses_for_header(email_message, field_name)]
+
+    @staticmethod
     def _parse_recipients(email_message: Message) -> list[str]:
         """Extract one canonical mailbox per To/Cc address.
 
         Address headers are structured RFC 5322 fields: commas can occur inside
         quoted display names and groups can contain multiple mailboxes.  Parsing
         the header registry's ``Address`` objects avoids treating either form as
-        a raw comma-separated string.
+        a raw comma-separated string. The display list still combines To and Cc.
+        Local To search uses :meth:`_parse_address_field` for ``To`` alone.
         """
         return [
-            str(address) for field_name in ("To", "Cc") for address in _addresses_for_header(email_message, field_name)
+            address
+            for field_name in ("To", "Cc")
+            for address in EmailClient._parse_address_field(email_message, field_name)
         ]
 
     @staticmethod
@@ -1366,17 +1713,47 @@ class EmailClient:
             return
         yield part, False
 
+    def _find_attachment_part(self, message: Message, name: str) -> Message | None:
+        """Match listed attachment roots, preferring exact names over NFC aliases."""
+        normalized_name = self._normalize_attachment_name(name)
+        fallback = None
+        for part, is_attachment in self._iter_content_parts(message):
+            if not is_attachment:
+                continue
+            filename = part.get_filename()
+            if not isinstance(filename, str) or not filename:
+                continue
+            if filename == name:
+                return part
+            if fallback is None and self._normalize_attachment_name(filename) == normalized_name:
+                fallback = part
+        return fallback
+
+    @staticmethod
+    def _attachment_content(part: Message) -> bytes | None:
+        """Decode leaves or serialize a structured attachment as a usable MIME file.
+
+        Encapsulated messages export the inner message, without the attachment
+        wrapper. Multipart attachments need their own content headers and boundary
+        to remain parseable. Structured exports use CRLF and may normalize MIME
+        serialization; ordinary leaf payloads retain their exact decoded bytes.
+        """
+        if part.get_content_type() == "message/rfc822":
+            payload = part.get_payload()
+            if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], Message):
+                return payload[0].as_bytes(policy=SMTP_POLICY.clone(refold_source="none"))
+            return None
+        if part.get_content_maintype() == "multipart" and part.is_multipart():
+            return _strip_to_content_headers(part).as_bytes(policy=SMTP_POLICY.clone(refold_source="none"))
+        return _decoded_payload(part)
+
     @staticmethod
     def _decode_text_part(part: Message) -> str:
         """Decode a MIME text part without losing the message on a bad charset."""
         payload = _decoded_payload(part)
         if not payload:
             return ""
-        charset = part.get_content_charset("utf-8")
-        try:
-            return payload.decode(charset)
-        except (LookupError, UnicodeDecodeError):
-            return payload.decode("utf-8", errors="replace")
+        return charsets.decode_text(payload, part.get_content_charset("utf-8"))
 
     def _parse_email_data(  # noqa: C901
         self,
@@ -1384,10 +1761,14 @@ class EmailClient:
         email_id: str | None = None,
         body_offset: int = 0,
         max_body_length: int = MAX_BODY_LENGTH,
+        parsed: Message | None = None,
     ) -> dict[str, Any]:
-        """Parse raw email data into a structured dictionary."""
-        parser = BytesParser(policy=default)
-        email_message = parser.parsebytes(raw_email)
+        """Parse raw email data into a structured dictionary.
+
+        ``parsed`` lets a caller that already holds the ``policy=default`` parse of
+        ``raw_email`` share it instead of paying a second full parse.
+        """
+        email_message = parsed if parsed is not None else BytesParser(policy=default).parsebytes(raw_email)
 
         # Extract email parts
         subject = email_message.get("Subject", "")
@@ -1401,8 +1782,10 @@ class EmailClient:
         in_reply_to = _first_thread_header(email_message, "In-Reply-To")
         references = _first_thread_header(email_message, "References")
 
-        # Extract recipients and parse date
+        # Extract recipients and parse date. ``to`` remains the display list
+        # (To plus Cc). ``to_addresses`` is only the To header, for local search.
         to_addresses = self._parse_recipients(email_message)
+        header_to = self._parse_address_field(email_message, "To")
         date = self._parse_date(date_str)
 
         # Get body content
@@ -1445,25 +1828,39 @@ class EmailClient:
             "subject": subject,
             "from": sender,
             "to": to_addresses,
+            "to_addresses": header_to,
             "body": body,
             "date": date,
             "attachments": attachments,
         }
 
     @staticmethod
-    def _sanitize_imap_value(value: str) -> ImapSearchToken:
-        """Encode user text as an RFC 3501 ``astring`` or UTF-8 literal."""
+    def _sanitize_imap_value(
+        value: str,
+        *,
+        non_ascii: ImapNonAsciiSearchEncoding = "literal",
+    ) -> ImapSearchToken:
+        """Encode user text as an RFC 3501 ``astring``, quoted string, or UTF-8 literal.
+
+        ``literal`` keeps the #230 synchronizing literal for non-ASCII text.
+        ``quoted`` sends a quoted UTF-8 string instead. Quoted mode rejects CR
+        and LF before the command is written, because those bytes would split
+        the single-line SEARCH. Other controls stay rejected in both modes.
+        """
+        if non_ascii == "quoted" and any(char in "\r\n" for char in value):
+            raise ValueError("IMAP search values must not contain CR or LF")
         if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
             raise ValueError("IMAP search values must not contain control characters")
         if not value.isascii():
+            if non_ascii == "quoted":
+                return _quote_imap_search_text(value)
             return _ImapSearchLiteral(value.encode("utf-8"))
         if _is_imap_astring(value):
             return value
-        escaped = value.replace("\\", "\\\\").replace('"', r"\"")
-        return f'"{escaped}"'
+        return _quote_imap_search_text(value)
 
     @staticmethod
-    def _build_search_criteria(
+    def _build_search_criteria(  # noqa: C901 - explicit independent IMAP search keys
         before: datetime | None = None,
         since: datetime | None = None,
         subject: str | None = None,
@@ -1475,12 +1872,39 @@ class EmailClient:
         flagged: bool | None = None,
         answered: bool | None = None,
         has_attachment: bool | None = None,
+        tag_keywords: list[str] | None = None,
+        tag_match: Literal["all", "any"] = "all",
+        non_ascii_search: ImapNonAsciiSearchEncoding = "literal",
     ) -> list[ImapSearchToken]:
         search_criteria: list[ImapSearchToken] = []
-        if before:
-            search_criteria.extend(["BEFORE", f"{before.day:02d}-{_IMAP_MONTHS[before.month - 1]}-{before.year:04d}"])
-        if since:
-            search_criteria.extend(["SINCE", f"{since.day:02d}-{_IMAP_MONTHS[since.month - 1]}-{since.year:04d}"])
+        before_utc = normalize_datetime_boundary(before, field_name="before")
+        since_utc = normalize_datetime_boundary(since, field_name="since")
+
+        # IMAP BEFORE/SINCE compare only the calendar part of INTERNALDATE and
+        # disregard its time and timezone. Accepted INTERNALDATE offsets are
+        # strictly less than 24 hours, so include the adjacent local date on
+        # each side and apply the exact UTC interval after FETCH INTERNALDATE.
+        if before_utc is not None:
+            try:
+                candidate_before = before_utc.date() + timedelta(days=2)
+            except OverflowError:
+                candidate_before = None
+            if candidate_before is not None:
+                search_criteria.extend([
+                    "BEFORE",
+                    f"{candidate_before.day:02d}-{_IMAP_MONTHS[candidate_before.month - 1]}-"
+                    f"{candidate_before.year:04d}",
+                ])
+        if since_utc is not None:
+            try:
+                candidate_since = since_utc.date() - timedelta(days=1)
+            except OverflowError:
+                candidate_since = None
+            if candidate_since is not None:
+                search_criteria.extend([
+                    "SINCE",
+                    f"{candidate_since.day:02d}-{_IMAP_MONTHS[candidate_since.month - 1]}-{candidate_since.year:04d}",
+                ])
 
         # Substring-match fields (IMAP keyword, value)
         text_criteria = [
@@ -1492,7 +1916,10 @@ class EmailClient:
         ]
         for keyword, value in text_criteria:
             if value:
-                search_criteria.extend([keyword, EmailClient._sanitize_imap_value(value)])
+                search_criteria.extend([
+                    keyword,
+                    EmailClient._sanitize_imap_value(value, non_ascii=non_ascii_search),
+                ])
 
         # Attachment heuristic: most attachments are carried in multipart/mixed.
         # May miss some types (e.g. inline images) or yield false positives.
@@ -1510,6 +1937,20 @@ class EmailClient:
         for flag_value, criteria_map in flag_criteria:
             if flag_value in criteria_map:
                 search_criteria.append(criteria_map[flag_value])
+
+        keywords = tag_keywords or []
+        if tag_match not in ("all", "any"):
+            raise ValueError("tag_match must be 'all' or 'any'")
+        for keyword in keywords:
+            if not _is_valid_imap_flag(keyword) or keyword.startswith("\\"):
+                raise ValueError("Invalid configured IMAP keyword")
+        if keywords and tag_match == "all":
+            for keyword in keywords:
+                search_criteria.extend(["KEYWORD", keyword])
+        elif keywords and tag_match == "any":
+            search_criteria.extend(["OR"] * (len(keywords) - 1))
+            for keyword in keywords:
+                search_criteria.extend(["KEYWORD", keyword])
 
         return search_criteria or ["ALL"]
 
@@ -1532,6 +1973,7 @@ class EmailClient:
             message_id = email_message.get("Message-ID")
 
             to_addresses = self._parse_recipients(email_message)
+            header_to = self._parse_address_field(email_message, "To")
             date = self._parse_date(date_str)
 
             return {
@@ -1540,6 +1982,7 @@ class EmailClient:
                 "subject": subject,
                 "from": sender,
                 "to": to_addresses,
+                "to_addresses": header_to,
                 "date": date,
                 "attachments": [],
             }
@@ -1637,7 +2080,7 @@ class EmailClient:
         budget = header_budget or _MetadataHeaderBudget()
         partial = f"<0.{MAX_METADATA_HEADER_BYTES + 1}>"
         fetch_item = f"(FLAGS BODY.PEEK[HEADER]{partial})" if include_flags else f"BODY.PEEK[HEADER]{partial}"
-        chunk_size = min(chunk_size, MAX_METADATA_HEADER_FETCH_UIDS)
+        chunk_size = min(chunk_size, _header_fetch_uid_limit())
         for start in range(0, len(str_ids), chunk_size):
             chunk = str_ids[start : start + chunk_size]
             uid_list = ",".join(chunk)
@@ -1682,6 +2125,50 @@ class EmailClient:
                     results[uid] = metadata
         return results
 
+    async def _batch_fetch_flags(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        email_ids: list[str],
+        *,
+        chunk_size: int = 500,
+    ) -> dict[str, list[str]]:
+        if not email_ids:
+            return {}
+        results: dict[str, list[str]] = {}
+        for start in range(0, len(email_ids), chunk_size):
+            chunk = email_ids[start : start + chunk_size]
+            response = await imap.uid("fetch", ",".join(chunk), "(FLAGS)")
+            _raise_for_imap_command_failure(response, f"FETCH flags for {len(chunk)} UIDs")
+            for item in response[1]:
+                if not isinstance(item, bytes):
+                    continue
+                uid_match = re.search(rb"UID (\d+)", item)
+                flags_match = re.search(rb"FLAGS \(([^)]*)\)", item)
+                if uid_match is not None and flags_match is not None:
+                    results[uid_match.group(1).decode()] = flags_match.group(1).decode(errors="replace").split()
+        return results
+
+    async def get_email_flags(self, email_ids: list[str], mailbox: str = "INBOX") -> dict[str, list[str]]:
+        """Fetch current flags for a bounded UID page without reading headers or bodies."""
+        _validate_imap_uids(email_ids)
+        if len(email_ids) > 100:
+            raise ValueError("email_ids must contain at most 100 values")
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            flags = await self._batch_fetch_flags(imap, email_ids)
+            if set(flags) != set(email_ids):
+                raise RuntimeError("Provider returned incomplete flag metadata")
+            return flags
+        except (TimeoutError, aioimaplib.CommandTimeout, asyncio.CancelledError):
+            _discard_metadata_imap(imap)
+            raise
+        finally:
+            await _close_metadata_imap(imap)
+
     async def _batch_fetch_senders(
         self,
         imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
@@ -1697,7 +2184,7 @@ class EmailClient:
         if not email_ids:
             return {}
 
-        chunk_size = min(chunk_size, MAX_METADATA_HEADER_FETCH_UIDS)
+        chunk_size = min(chunk_size, _header_fetch_uid_limit())
         chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
         senders: dict[str, str] = {}
         budget = header_budget or _MetadataHeaderBudget()
@@ -1758,31 +2245,195 @@ class EmailClient:
         return {uid for uid in email_ids if not sender_allowed(uid_senders.get(uid, ""), allowed_senders)}
 
     @staticmethod
-    def _parse_mailbox_state(response: Any) -> MailboxState:
+    def _response_bytes(data: Any) -> bytes:
+        if not isinstance(data, list | tuple):
+            return b""
+        parts: list[bytes] = []
+        for item in data:
+            if isinstance(item, bytes):
+                parts.append(item)
+            elif isinstance(item, bytearray):
+                parts.append(bytes(item))
+        return b" ".join(parts)
+
+    @staticmethod
+    def _match_status_int(payload: bytes, name: bytes) -> int | None:
+        match = re.search(rb"\b" + name + rb"\s+(\d+)\b", payload, re.IGNORECASE)
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    @staticmethod
+    def _parse_mailbox_status_fields(response: Any) -> tuple[int | None, int | None, int]:
+        """Return UIDVALIDITY, UIDNEXT, and MESSAGES.
+
+        MESSAGES is required. UIDVALIDITY and UIDNEXT may be omitted.
+        ``None`` means that response did not carry the field. Callers keep the
+        absence instead of inventing an epoch or an allocation counter.
+        """
+
         _raise_for_imap_command_failure(response, "STATUS mailbox")
         _, data = response
-        payload = b" ".join(item for item in data if isinstance(item, bytes))
-        values: dict[bytes, int] = {}
-        for name in (b"UIDVALIDITY", b"UIDNEXT", b"MESSAGES"):
-            match = re.search(rb"\b" + name + rb"\s+(\d+)\b", payload, re.IGNORECASE)
-            if match is None:
-                raise RuntimeError("STATUS mailbox did not return required bounded state")
-            values[name] = int(match.group(1))
-        if values[b"UIDVALIDITY"] < 1 or values[b"UIDNEXT"] < 1 or values[b"MESSAGES"] < 0:
+        payload = EmailClient._response_bytes(data)
+        message_count = EmailClient._match_status_int(payload, b"MESSAGES")
+        if message_count is None:
+            raise RuntimeError("STATUS mailbox did not return required bounded state")
+        uidvalidity = EmailClient._match_status_int(payload, b"UIDVALIDITY")
+        uidnext = EmailClient._match_status_int(payload, b"UIDNEXT")
+        if message_count < 0 or (uidvalidity is not None and uidvalidity < 1) or (uidnext is not None and uidnext < 1):
             raise RuntimeError("STATUS mailbox returned invalid state")
-        return MailboxState(
-            uidvalidity=values[b"UIDVALIDITY"],
-            uidnext=values[b"UIDNEXT"],
-            message_count=values[b"MESSAGES"],
-        )
+        return uidvalidity, uidnext, message_count
+
+    @staticmethod
+    def _parse_select_state_fields(response: Any) -> tuple[int | None, int | None]:
+        """Return UIDVALIDITY and UIDNEXT when SELECT carried them.
+
+        EXISTS is not a substitute for STATUS MESSAGES. A bare untagged count
+        is ignored so a short SELECT payload cannot be mistaken for UIDNEXT.
+        """
+
+        if not isinstance(response, tuple) or len(response) < 2:
+            return None, None
+        payload = EmailClient._response_bytes(response[1])
+        uidvalidity = EmailClient._match_status_int(payload, b"UIDVALIDITY")
+        uidnext = EmailClient._match_status_int(payload, b"UIDNEXT")
+        if uidvalidity is not None and uidvalidity < 1:
+            uidvalidity = None
+        if uidnext is not None and uidnext < 1:
+            uidnext = None
+        return uidvalidity, uidnext
+
+    @staticmethod
+    def _parse_mailbox_state(response: Any) -> MailboxState:
+        """Parse a STATUS response that includes every qualification field.
+
+        Qualification itself uses :meth:`_status_mailbox`, which preserves an
+        omitted UIDNEXT or UIDVALIDITY as unknown. This helper remains strict
+        for callers that already hold a complete response.
+        """
+
+        uidvalidity, uidnext, message_count = EmailClient._parse_mailbox_status_fields(response)
+        if uidvalidity is None or uidnext is None:
+            raise RuntimeError("STATUS mailbox did not return required bounded state")
+        return MailboxState(uidvalidity=uidvalidity, uidnext=uidnext, message_count=message_count)
+
+    async def _fetch_uid_inventory(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        *,
+        maximum_uids: int,
+    ) -> list[str]:
+        """Return every UID from ``UID FETCH 1:* (UID)`` without reading headers.
+
+        Used when STATUS and SELECT omit UIDNEXT or UIDVALIDITY. Coverage is
+        the inventory itself: a gap left by an expunge stays in the UID set and
+        is not turned into ``max(uid) + 1``. The list is not truncated, because
+        a partial inventory cannot prove that every message was observed.
+        """
+
+        if maximum_uids < 1:
+            raise ValueError("Metadata UID inventory limit is invalid")
+        response = await imap.uid("fetch", "1:*", "(UID)")
+        _raise_for_imap_command_failure(response, "FETCH mailbox UID inventory")
+        _, data = response
+        if not isinstance(data, list | tuple):
+            raise MetadataProviderObservationError("Provider returned invalid UID inventory")
+        found: list[str] = []
+        seen: set[str] = set()
+        for item in data:
+            if isinstance(item, bytearray):
+                raw = bytes(item)
+            elif isinstance(item, bytes):
+                raw = item
+            else:
+                continue
+            for match in re.finditer(rb"\bUID\s+([1-9][0-9]*)\b", raw):
+                token = match.group(1).decode("ascii")
+                value = int(token)
+                if value > MAX_IMAP_UID or token in seen:
+                    raise MetadataProviderObservationError("Provider returned invalid UID inventory")
+                seen.add(token)
+                found.append(token)
+                if len(found) > maximum_uids:
+                    raise MetadataQueryTooBroadError(
+                        f"query_too_broad: metadata search exceeded {maximum_uids} candidate UIDs"
+                    )
+        return found
 
     async def _status_mailbox(
         self,
         imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
         mailbox: str,
     ) -> MailboxState:
+        """Read mailbox qualification without inventing omitted provider fields.
+
+        A complete STATUS response is returned unchanged. When UIDNEXT or
+        UIDVALIDITY is missing, SELECT is checked next because some servers
+        put those values only in the SELECT response codes. A field that is
+        still missing stays ``None``. Conflicting UIDVALIDITY values reject
+        the observation instead of combining fields from different epochs.
+
+        Omitted UIDNEXT is not replaced with ``max(uid) + 1``. Snapshot and
+        delta reads use ``UID FETCH 1:* (UID)`` as coverage evidence, so an
+        expunge gap does not change the message count or hide a UID. Omitted
+        UIDVALIDITY is not replaced with a hash of the UID set. Callers must
+        not reuse rows across observations that have no UIDVALIDITY. MESSAGES
+        remains required.
+        """
+
         response = await imap.status(_quote_mailbox(mailbox), "(UIDVALIDITY UIDNEXT MESSAGES)")
-        return self._parse_mailbox_state(response)
+        uidvalidity, uidnext, message_count = self._parse_mailbox_status_fields(response)
+        if uidvalidity is None or uidnext is None:
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            selected_validity, selected_next = self._parse_select_state_fields(select_response)
+            if uidvalidity is not None and selected_validity is not None and uidvalidity != selected_validity:
+                raise MetadataProviderObservationError("Provider UIDVALIDITY changed between STATUS and SELECT")
+            if uidvalidity is None and selected_validity is not None:
+                uidvalidity = selected_validity
+            if uidnext is None and selected_next is not None:
+                uidnext = selected_next
+        if uidnext is None:
+            _notice_mailbox_state(
+                "uidnext",
+                "IMAP STATUS omitted UIDNEXT; coverage uses the UID inventory instead of an allocation counter",
+            )
+        if uidvalidity is None:
+            _notice_mailbox_state(
+                "uidvalidity",
+                "IMAP STATUS omitted UIDVALIDITY; cached rows will not be reused",
+            )
+        return MailboxState(
+            uidvalidity=uidvalidity,
+            uidnext=uidnext,
+            message_count=message_count,
+        )
+
+    async def _snapshot_uid_list(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        state: MailboxState,
+        mailbox: str,
+        *,
+        maximum_uids: int,
+    ) -> list[str]:
+        """List snapshot UIDs, using UID FETCH when qualification is incomplete.
+
+        A server that omits UIDNEXT or UIDVALIDITY does not get ``UID SEARCH``
+        as its membership source. Some of those servers accept SEARCH and then
+        return an empty set for a mailbox that has messages. The UID inventory
+        is the coverage evidence instead. Hosts that return both qualification
+        fields keep SEARCH, including a genuinely empty result.
+        """
+
+        if state.uidnext is None or state.uidvalidity is None:
+            if state.message_count == 0:
+                return []
+            return await self._fetch_uid_inventory(imap, maximum_uids=maximum_uids)
+        search_response = await imap.uid_search("ALL", charset=None)
+        _raise_for_imap_command_failure(search_response, f"SEARCH mailbox {mailbox}")
+        _, messages = search_response
+        return _normalize_search_uids(messages, maximum_uids=maximum_uids)
 
     async def get_mailbox_state(self, mailbox: str = "INBOX") -> MailboxState:
         """Read the small provider state needed to qualify a complete projection."""
@@ -1791,24 +2442,180 @@ class EmailClient:
             await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
             return await self._status_mailbox(imap, mailbox)
+        except (TimeoutError, aioimaplib.CommandTimeout, asyncio.CancelledError):
+            _discard_metadata_imap(imap)
+            raise
         finally:
-            try:
-                await imap.logout()
-            except Exception:
-                logger.info("IMAP logout failed")
+            await _close_metadata_imap(imap)
 
-    async def get_mailbox_metadata_snapshot(
+    async def get_mailbox_metadata_snapshot(  # noqa: C901 - bounded snapshot evidence checks
         self,
         mailbox: str = "INBOX",
         *,
-        maximum_window: int = MAX_INDEXED_UID_WINDOW,
+        maximum_window: int | None = None,
         candidate_limit: int = MAX_METADATA_CANDIDATES,
+        retained_emails: Sequence[dict[str, Any]] | None = None,
+        retained_uidvalidity: int | None = None,
     ) -> MailboxMetadataSnapshot:
-        """Observe one bounded recent UID window without fetching message bodies."""
-        if not 1 <= maximum_window <= candidate_limit:
+        """Observe one bounded recent UID window without fetching message bodies.
+
+        UIDs are fetched newest-first. Each batch has its own refresh timeout and
+        header budget. Connection establishment has the same bounded timeout.
+        Rows retained from an earlier snapshot are reused only when their supplied
+        UIDVALIDITY is a real provider value and matches this observation. A
+        missing UIDVALIDITY never reuses rows. A batch failure returns the newest
+        rows with ``complete=False`` instead of dropping them. A partial result
+        never claims complete coverage.
+        """
+        if maximum_window is None:
+            maximum_window = metadata_snapshot_row_limit()
+        if maximum_window < 1 or candidate_limit < 1:
             raise ValueError("Metadata snapshot window is invalid")
-        imap = await self._connect_imap()
+        timeout_seconds = metadata_refresh_timeout_seconds()
+        batch_limit = metadata_refresh_batch_limit()
+        uid_ceiling = max(candidate_limit, maximum_window)
+        async with asyncio.timeout(timeout_seconds):
+            imap = await self._connect_imap(timeout=timeout_seconds)
         observed_at = datetime.now(UTC)
+        mailbox_info = MailboxInfo(name=mailbox, delimiter="", flags=[])
+        batch_failed = False
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+                await _send_imap_id(imap)
+                list_response = await imap.list(
+                    '""',
+                    _quote_mailbox(mailbox),  # pyright: ignore[reportArgumentType]
+                )
+                if isinstance(list_response, tuple) and str(list_response[0]).upper() == "OK":
+                    for parsed in _parse_list_responses(list_response[1]):
+                        if parsed.name == mailbox:
+                            mailbox_info = parsed
+                            break
+                state = await self._status_mailbox(imap, mailbox)
+                select_response = await imap.select(_quote_mailbox(mailbox))
+                _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+                email_ids = await self._snapshot_uid_list(imap, state, mailbox, maximum_uids=uid_ceiling)
+            if len(email_ids) > uid_ceiling:
+                raise MetadataQueryTooBroadError(
+                    f"query_too_broad: metadata search exceeded {uid_ceiling} candidate UIDs"
+                )
+            selected_ids = sorted(email_ids, key=_uid_sort_key, reverse=True)[:maximum_window]
+            retained = _retained_snapshot_rows(
+                retained_emails if _same_provider_epoch(retained_uidvalidity, state) else None,
+                allowed=set(selected_ids),
+            )
+            missing = [uid for uid in selected_ids if uid not in retained]
+            fetched: dict[str, dict[str, Any]] = {}
+            uid_dates: dict[str, datetime] = {
+                uid: row["_internal_date"]
+                for uid, row in retained.items()
+                if isinstance(row.get("_internal_date"), datetime)
+            }
+            for batch in _metadata_refresh_batches(missing, batch_limit):
+                try:
+                    async with asyncio.timeout(timeout_seconds):
+                        batch_dates = await self._batch_fetch_dates(imap, batch)
+                        metadata_by_uid = await self._batch_fetch_headers(imap, batch, include_flags=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if not any(uid in fetched or uid in retained for uid in selected_ids):
+                        raise
+                    batch_failed = True
+                    log_safe_failure("Metadata snapshot batch failed; keeping the newest fetched rows", exc)
+                    break
+                for uid in batch:
+                    metadata = metadata_by_uid.get(uid)
+                    if not isinstance(metadata, dict):
+                        continue
+                    copied = dict(metadata)
+                    copied["_internal_date"] = batch_dates.get(uid)
+                    fetched[uid] = copied
+                    internal_date = copied["_internal_date"]
+                    if isinstance(internal_date, datetime):
+                        uid_dates[uid] = internal_date
+                    else:
+                        uid_dates.pop(uid, None)
+            emails: list[dict[str, Any]] = []
+            for uid in selected_ids:
+                row = fetched.get(uid)
+                if row is None:
+                    row = retained.get(uid)
+                if row is not None:
+                    emails.append(row)
+            final_state = state
+            if not batch_failed:
+                try:
+                    async with asyncio.timeout(timeout_seconds):
+                        final_state = await self._status_mailbox(imap, mailbox)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if not emails:
+                        raise
+                    batch_failed = True
+                    log_safe_failure("Metadata snapshot batch failed; keeping the newest fetched rows", exc)
+            if not batch_failed and state.uidvalidity != final_state.uidvalidity:
+                # The two observations disagree, including unknown versus a real
+                # epoch. Two omitted UIDVALIDITY values are one consistent read;
+                # they are still ineligible for reuse on a later request.
+                emails = []
+            valid_epoch_uids = all(_uid_belongs_to_epoch(email, final_state.uidnext) for email in emails)
+            complete = (
+                not batch_failed
+                and state == final_state
+                and valid_epoch_uids
+                and len(email_ids) <= maximum_window
+                and set(uid_dates) == set(email_ids)
+                and len(emails) == len(email_ids)
+                and all(isinstance(email.get("_internal_date"), datetime) for email in emails)
+                and final_state.message_count == len(email_ids)
+            )
+            return MailboxMetadataSnapshot(
+                state=final_state,
+                mailbox=mailbox_info,
+                emails=tuple(emails),
+                complete=complete,
+                observed_at=observed_at,
+            )
+        except (TimeoutError, aioimaplib.CommandTimeout, asyncio.CancelledError):
+            batch_failed = True
+            raise
+        finally:
+            await _close_metadata_imap(imap, discard=batch_failed)
+
+    async def get_mailbox_uid_delta(  # noqa: C901 - explicit UIDVALIDITY and append-only evidence checks
+        self,
+        mailbox: str,
+        minimum_exclusive_uid: int,
+        *,
+        maximum_new_messages: int,
+    ) -> MailboxUidDelta:
+        """Fetch only UIDs above a cached high-water mark for one UIDVALIDITY epoch.
+
+        A result is resumable only when every returned UID is strictly above the
+        watermark and header/INTERNALDATE evidence is complete. Callers still
+        have to prove the message count grew by exactly that many UIDs before
+        treating the merge as complete coverage. UIDVALIDITY, UIDNEXT, and the
+        message count must also remain stable throughout this fetch; otherwise
+        concurrent expunges and arrivals can hide an unobserved replacement.
+        """
+        if minimum_exclusive_uid < 0 or minimum_exclusive_uid > MAX_IMAP_UID:
+            raise ValueError("Incremental metadata UID is invalid")
+        if maximum_new_messages < 0:
+            raise ValueError("Incremental metadata window is invalid")
+        observed_at = datetime.now(UTC)
+        if maximum_new_messages == 0:
+            return MailboxUidDelta(
+                state=MailboxState(uidvalidity=1, uidnext=1, message_count=0),
+                mailbox=MailboxInfo(name=mailbox, delimiter="", flags=[]),
+                emails=(),
+                observed_at=observed_at,
+                uidvalidity_changed=False,
+                resumable=False,
+            )
+        imap = await self._connect_imap()
         mailbox_info = MailboxInfo(name=mailbox, delimiter="", flags=[])
         try:
             await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
@@ -1825,53 +2632,69 @@ class EmailClient:
             state = await self._status_mailbox(imap, mailbox)
             select_response = await imap.select(_quote_mailbox(mailbox))
             _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
-            search_response = await imap.uid_search("ALL", charset=None)
-            _raise_for_imap_command_failure(search_response, f"SEARCH mailbox {mailbox}")
-            _, messages = search_response
-            email_ids = _normalize_search_uids(messages)
-            if len(email_ids) > candidate_limit:
-                raise MetadataQueryTooBroadError(
-                    f"query_too_broad: metadata search exceeded {candidate_limit} candidate UIDs"
+            uid_limit = max(MAX_METADATA_CANDIDATES, metadata_snapshot_row_limit())
+            if minimum_exclusive_uid >= MAX_IMAP_UID:
+                email_ids: list[str] = []
+            elif state.uidnext is None or state.uidvalidity is None:
+                # UID SEARCH is not coverage evidence without both qualification
+                # fields. The UID inventory lists messages above the watermark.
+                if state.message_count == 0:
+                    email_ids = []
+                else:
+                    inventory = await self._fetch_uid_inventory(imap, maximum_uids=uid_limit)
+                    email_ids = [uid for uid in inventory if int(uid) > minimum_exclusive_uid]
+            else:
+                search_response = await imap.uid_search("UID", f"{minimum_exclusive_uid + 1}:*", charset=None)
+                _raise_for_imap_command_failure(search_response, f"SEARCH mailbox {mailbox}")
+                _, messages = search_response
+                email_ids = _normalize_search_uids(messages, maximum_uids=uid_limit)
+            above_watermark = all(int(uid) > minimum_exclusive_uid for uid in email_ids)
+            if not above_watermark or len(email_ids) > maximum_new_messages:
+                final_state = await self._status_mailbox(imap, mailbox)
+                return MailboxUidDelta(
+                    state=final_state,
+                    mailbox=mailbox_info,
+                    emails=(),
+                    observed_at=observed_at,
+                    uidvalidity_changed=_observation_identity_changed(state, final_state),
+                    resumable=False,
                 )
-            selected_ids = sorted(email_ids, key=_uid_sort_key, reverse=True)[:maximum_window]
-            uid_dates = await self._batch_fetch_dates(imap, selected_ids)
-            metadata_by_uid = await self._batch_fetch_headers(imap, selected_ids, include_flags=True)
+            uid_dates = await self._batch_fetch_dates(imap, email_ids)
+            metadata_by_uid = await self._batch_fetch_headers(imap, email_ids, include_flags=True)
             emails: list[dict[str, Any]] = []
-            for uid in selected_ids:
+            for uid in email_ids:
                 metadata = metadata_by_uid.get(uid)
                 if metadata is None:
                     continue
                 metadata["_internal_date"] = uid_dates.get(uid)
                 emails.append(metadata)
             final_state = await self._status_mailbox(imap, mailbox)
-            valid_epoch_uids = all(
-                email["email_id"].isdigit() and 0 < int(email["email_id"]) < final_state.uidnext for email in emails
-            )
-            same_epoch = state.uidvalidity == final_state.uidvalidity
-            if not same_epoch:
-                # Rows fetched across an epoch transition have no safe namespace.
-                emails = []
-            complete = (
-                state == final_state
-                and valid_epoch_uids
-                and len(email_ids) <= maximum_window
-                and set(uid_dates) == set(email_ids)
+            changed = _observation_identity_changed(state, final_state)
+            resumable = (
+                not changed
+                and state.uidnext is not None
+                and final_state.uidnext is not None
+                and state == final_state
                 and len(emails) == len(email_ids)
+                and set(uid_dates) == set(email_ids)
                 and all(isinstance(email.get("_internal_date"), datetime) for email in emails)
-                and final_state.message_count == len(email_ids)
+                and all(_uid_belongs_to_epoch(email, final_state.uidnext) for email in emails)
             )
-            return MailboxMetadataSnapshot(
+            if changed:
+                emails = []
+            return MailboxUidDelta(
                 state=final_state,
                 mailbox=mailbox_info,
                 emails=tuple(emails),
-                complete=complete,
                 observed_at=observed_at,
+                uidvalidity_changed=changed,
+                resumable=resumable,
             )
+        except (TimeoutError, aioimaplib.CommandTimeout, asyncio.CancelledError):
+            _discard_metadata_imap(imap)
+            raise
         finally:
-            try:
-                await imap.logout()
-            except Exception:
-                logger.info("IMAP logout failed")
+            await _close_metadata_imap(imap)
 
     async def get_emails_metadata(  # noqa: C901 - bounded compatibility query decision tree
         self,
@@ -1890,12 +2713,17 @@ class EmailClient:
         body: str | None = None,
         text: str | None = None,
         has_attachment: bool | None = None,
+        tag_keywords: list[str] | None = None,
+        tag_match: Literal["all", "any"] = "all",
         allowed_senders: list[str] | None = None,
     ) -> tuple[int, list[dict[str, Any]]]:
         if page < 1:
             raise ValueError("page must be at least 1")
         if not 1 <= page_size <= 100:
             raise ValueError("page_size must be between 1 and 100")
+        non_ascii_search = self._non_ascii_search_encoding()
+        before_utc = normalize_datetime_boundary(before, field_name="before")
+        since_utc = normalize_datetime_boundary(since, field_name="since")
         imap = await self._connect_imap()
         try:
             # Login and select mailbox
@@ -1905,8 +2733,8 @@ class EmailClient:
             _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
 
             search_criteria = self._build_search_criteria(
-                before,
-                since,
+                before_utc,
+                since_utc,
                 subject,
                 body=body,
                 text=text,
@@ -1916,12 +2744,16 @@ class EmailClient:
                 flagged=flagged,
                 answered=answered,
                 has_attachment=has_attachment,
+                tag_keywords=tag_keywords,
+                tag_match=tag_match,
+                non_ascii_search=non_ascii_search,
             )
             logger.info(f"Get metadata: Search criteria: {search_criteria}")
 
-            # ASCII searches omit CHARSET for Exchange compatibility. Non-ASCII
-            # values use synchronizing UTF-8 literals because aioimaplib's
-            # convenience API otherwise emits invalid raw UTF-8 atoms.
+            # ASCII searches omit CHARSET for Exchange compatibility (#178).
+            # Non-ASCII values use synchronizing UTF-8 literals (#189, #230)
+            # unless this account resolved quoted mode, which sends one quoted
+            # UTF-8 string with CHARSET UTF-8 for servers such as QQ Mail.
             search_response = await _uid_search(imap, search_criteria)
             _raise_for_imap_command_failure(search_response, f"SEARCH mailbox {mailbox}")
             _, messages = search_response
@@ -1932,6 +2764,9 @@ class EmailClient:
                 return 0, []
 
             email_ids = _normalize_search_uids(messages)
+            if not email_ids:
+                logger.warning("No messages returned from search")
+                return 0, []
             logger.info(f"Found {len(email_ids)} email IDs")
             header_budget = _MetadataHeaderBudget()
 
@@ -1945,7 +2780,7 @@ class EmailClient:
                 if not email_ids:
                     return 0, []
 
-            # Phase 1: Batch fetch INTERNALDATE for sorting (sequential chunks)
+            # Phase 1: Batch fetch INTERNALDATE for exact datetime filtering and sorting.
             fetch_dates_start = time.perf_counter()
             uid_dates = await self._batch_fetch_dates(imap, email_ids)
             fetch_dates_elapsed = time.perf_counter() - fetch_dates_start
@@ -1957,6 +2792,18 @@ class EmailClient:
                 raise MetadataProviderObservationError(
                     f"Provider returned incomplete INTERNALDATE metadata for {missing_date_count} UIDs"
                 )
+
+            if before_utc is not None or since_utc is not None:
+                candidate_count = len(email_ids)
+                email_ids = [
+                    uid
+                    for uid in email_ids
+                    if (since_utc is None or uid_dates[uid] >= since_utc)
+                    and (before_utc is None or uid_dates[uid] < before_utc)
+                ]
+                logger.info(f"Exact INTERNALDATE filter: {len(email_ids)} of {candidate_count} match")
+                if not email_ids:
+                    return 0, []
 
             # Keep UID SEARCH results as the source of truth and require
             # INTERNALDATE for exact provider-compatible ordering.
@@ -1990,7 +2837,9 @@ class EmailClient:
 
             # Phase 2: Batch fetch headers for requested page only
             fetch_headers_start = time.perf_counter()
-            metadata_by_uid = await self._batch_fetch_headers(imap, page_uids, header_budget=header_budget)
+            metadata_by_uid = await self._batch_fetch_headers(
+                imap, page_uids, include_flags=True, header_budget=header_budget
+            )
             fetch_headers_elapsed = time.perf_counter() - fetch_headers_start
 
             logger.info(
@@ -2003,11 +2852,11 @@ class EmailClient:
                 raise RuntimeError("Provider returned an incomplete metadata page")
             page_emails = [metadata_by_uid[uid] for uid in page_uids]
             return len(email_ids), page_emails
+        except (TimeoutError, aioimaplib.CommandTimeout, asyncio.CancelledError):
+            _discard_metadata_imap(imap)
+            raise
         finally:
-            try:
-                await imap.logout()
-            except Exception:
-                logger.info("IMAP logout failed")
+            await _close_metadata_imap(imap)
 
     def _check_email_content(self, data: list) -> bool:
         """Check whether a FETCH response contains a full-message literal."""
@@ -2040,9 +2889,19 @@ class EmailClient:
                 return payload
         return None
 
+    @staticmethod
+    def _extract_message_flags(data: list) -> list[str]:
+        for item in data:
+            if not isinstance(item, bytes):
+                continue
+            match = re.search(rb"FLAGS \(([^)]*)\)", item)
+            if match is not None:
+                return match.group(1).decode(errors="replace").split()
+        return []
+
     async def _fetch_email_with_formats(self, imap, email_id: str) -> list | None:
         """Try non-mutating fetch formats to get email data."""
-        fetch_formats = ["BODY.PEEK[]", "(BODY.PEEK[])"]
+        fetch_formats = ["(FLAGS BODY.PEEK[])", "FLAGS BODY.PEEK[]"]
 
         for fetch_format in fetch_formats:
             try:
@@ -2105,6 +2964,7 @@ class EmailClient:
                 email_data = self._parse_email_data(
                     raw_email, email_id, body_offset=body_offset, max_body_length=max_body_length
                 )
+                email_data["_flags"] = self._extract_message_flags(data)
             except Exception as e:
                 logger.error(f"Error parsing email: {e!s}")
                 return None
@@ -2120,7 +2980,7 @@ class EmailClient:
             except Exception:
                 logger.info("IMAP logout failed")
 
-    async def fetch_attachment(  # noqa: C901 - bounded MIME selection and provider cleanup
+    async def fetch_attachment(
         self,
         email_id: str,
         attachment_name: str,
@@ -2169,36 +3029,19 @@ class EmailClient:
             parser = BytesParser(policy=default)
             email_message = parser.parsebytes(raw_email)
 
-            # Find the attachment
-            attachment_data: bytes | None = None
-            mime_type = None
-            normalized_attachment_name = self._normalize_attachment_name(attachment_name)
-
-            if email_message.is_multipart():
-                for part in email_message.walk():
-                    # Match attachments listed by ``_parse_email_data`` — this includes
-                    # inline-disposition parts with a filename (e.g. iOS Mail photos).
-                    if not self._is_attachment_part(part):
-                        continue
-                    filename = part.get_filename()
-                    if not isinstance(filename, str):
-                        continue
-                    if self._normalize_attachment_name(filename) == normalized_attachment_name:
-                        attachment_data = _decoded_payload(part)
-                        mime_type = part.get_content_type()
-                        break
-
+            # Use the same roots as the list, including single-part messages,
+            # without allowing a nested attachment to shadow a listed filename.
+            part = self._find_attachment_part(email_message, attachment_name)
+            attachment_data = self._attachment_content(part) if part is not None else None
             if attachment_data is None:
                 msg = f"Attachment '{attachment_name}' not found in email {email_id}"
                 logger.error(msg)
                 raise ValueError(msg)
-            if len(attachment_data) > MAX_ATTACHMENT_BYTES:
-                raise ValueError(f"attachment exceeds {MAX_ATTACHMENT_BYTES} bytes")
 
             return {
                 "email_id": email_id,
                 "attachment_name": attachment_name,
-                "mime_type": mime_type or "application/octet-stream",
+                "mime_type": part.get_content_type() if part is not None else "application/octet-stream",
                 "content": attachment_data,
             }
 
@@ -2221,6 +3064,8 @@ class EmailClient:
         content = result["content"]
         if not isinstance(content, bytes):
             raise TypeError("Attachment content is invalid")
+        if len(content) > MAX_ATTACHMENT_BYTES:
+            raise ValueError(f"attachment exceeds {MAX_ATTACHMENT_BYTES} bytes")
         save_file = Path(save_path)
         save_file.parent.mkdir(parents=True, exist_ok=True)
         save_file.write_bytes(content)
@@ -2231,6 +3076,125 @@ class EmailClient:
             "size": len(content),
             "saved_path": str(save_file.resolve()),
         }
+
+    async def fetch_forward_source(
+        self,
+        email_id: str,
+        mailbox: str = "INBOX",
+        allowed_senders: list[str] | None = None,
+        include_attachments: bool = True,
+    ) -> dict[str, Any]:
+        """Read one source message and return everything a forward needs to compose.
+
+        The whole read runs inside a single IMAP session: the sender allowlist is
+        checked against the same SELECTed mailbox view that the body is then fetched
+        from, so there is no second round trip and no window in which the message
+        could be replaced between the authority check and the read.
+
+        Every unreadable-source outcome raises instead of degrading to an empty or
+        partial result. A forward delivered without the parts it was supposed to carry
+        is silent content loss, not partial success, so the caller must never be able
+        to confuse "the source had no attachments" with "the source could not be read".
+        A blocked sender raises the identical not-found-shaped error as a missing UID,
+        keeping the allowlist from acting as an existence oracle.
+
+        Args:
+            email_id: UID of the source message to forward.
+            mailbox: Mailbox that holds the source message (default: "INBOX").
+            allowed_senders: Optional sender allowlist; a non-allowed sender's message
+                is treated as not found and its body is never fetched.
+            include_attachments: Re-attach the source's attachment parts when True.
+
+        Returns:
+            ``subject``, ``from``, ``recipients`` and ``date`` from the source headers,
+            ``body`` holding the complete composed forwarded-message block, and
+            ``parts`` holding the source's attachment parts normalized for
+            re-attachment (empty when ``include_attachments`` is False).
+
+        Raises:
+            ValueError: The UID is malformed, the message is missing or blocked, the
+                source exceeds the raw message size limit, or it cannot be parsed.
+            RuntimeError: An IMAP command returned a non-OK status.
+        """
+        validate_imap_uid(email_id)
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+
+            # Read-path allowlist: check the From header before fetching the body, so a
+            # blocked sender's message is never read and never reaches a compose call.
+            await self._enforce_sender_allowlist(imap, email_id, allowed_senders)
+
+            data = await self._fetch_email_with_formats(imap, email_id)
+            if not data:
+                msg = f"Failed to fetch email with UID {email_id}"
+                logger.error(msg)
+                raise ValueError(msg)
+
+            raw_email = self._extract_raw_email(data)
+            if not raw_email:
+                msg = f"Could not find email data for email ID: {email_id}"
+                logger.error(msg)
+                raise ValueError(msg)
+            if len(raw_email) > MAX_RAW_EMAIL_BYTES:
+                raise ValueError("Email exceeds the raw message size limit")
+
+            try:
+                email_message = BytesParser(policy=default).parsebytes(raw_email)
+                # The read-path 20k display window must not decide what a forward
+                # carries: parse past the compose byte limit so the application
+                # layer's body validation stays authoritative for oversize.
+                email_data = self._parse_email_data(
+                    raw_email,
+                    email_id,
+                    max_body_length=FORWARD_SOURCE_BODY_WINDOW,
+                    parsed=email_message,
+                )
+            except Exception as error:
+                # The public message stays fixed-shape: parser exception text can
+                # embed fragments of the offending header or payload.
+                logger.error(f"Could not parse email {email_id} for forwarding: {error}")
+                msg = f"Could not parse email {email_id} for forwarding"
+                raise ValueError(msg) from error
+
+            # Collect attachment roots without descending into them, so a nested
+            # subtree (a multipart/related gallery, a message/rfc822 capsule) is
+            # carried across whole instead of being flattened into its leaves.
+            parts: list[Message] = []
+            if include_attachments:
+                # A root that is itself the attachment is stripped to its content
+                # headers so the source's envelope block never rides along.
+                parts = [
+                    _strip_to_content_headers(part) if part is email_message else normalize_forwarded_part(part)
+                    for part, is_attachment in self._iter_content_parts(email_message)
+                    if is_attachment
+                ]
+
+            recipients = email_data["to"]
+            # No fabricated provenance: a source without a Date header yields an
+            # empty date and the quoting block omits the line entirely.
+            date = _first_thread_header(email_message, "Date") or ""
+            return {
+                # The policy=default Subject is a structured header object (a str
+                # subclass); coerce so both derived-subject branches downstream
+                # carry a plain str with uniform folding behavior.
+                "subject": str(email_data["subject"]),
+                "from": email_data["from"],
+                "recipients": recipients,
+                "date": date,
+                "body": _format_forwarded_text(
+                    email_data["from"], recipients, date, email_data["subject"], email_data["body"]
+                ),
+                "parts": parts,
+            }
+        finally:
+            try:
+                await imap.logout()
+            except Exception:
+                logger.info("IMAP logout failed")
 
     def _validate_attachment(self, file_path: str) -> Path:
         """Validate attachment file path."""
@@ -2287,8 +3251,14 @@ class EmailClient:
         logger.info(f"Inlined image: {path.name} (cid:{path.name})")
         return part
 
-    def _create_message_with_attachments(self, body: str, html: bool, attachments: list[str]) -> MIMEMultipart:
-        """Create multipart message with attachments.
+    def _create_message_with_attachments(
+        self,
+        body: str,
+        html: bool,
+        attachments: list[str] | None,
+        extra_parts: list[Message] | None = None,
+    ) -> MIMEMultipart:
+        """Create multipart message with attachments and already-built MIME parts.
 
         In HTML bodies, ``cid:<filename>`` references (e.g. ``<img
         src="cid:chart.png">``) are matched against attachment basenames:
@@ -2304,7 +3274,7 @@ class EmailClient:
         inline_parts: list[MIMEImage] = []
         regular_parts: list[MIMEBase] = []
         total_attachment_bytes = 0
-        for file_path in attachments:
+        for file_path in attachments or []:
             try:
                 path = self._validate_attachment(file_path)
                 file_data = self._read_attachment(path)
@@ -2324,7 +3294,7 @@ class EmailClient:
             body_container.attach(text_part)
             for inline_part in inline_parts:
                 body_container.attach(inline_part)
-            if not regular_parts:
+            if not regular_parts and not extra_parts:
                 return cast(MIMEMultipart, body_container)
         else:
             body_container = text_part
@@ -2333,6 +3303,21 @@ class EmailClient:
         msg.attach(body_container)
         for part in regular_parts:
             msg.attach(part)
+        # Forwarded parts arrive already bounded by the source-read size limit and
+        # already normalized for re-attachment, so they are attached verbatim after
+        # the caller's own files.
+        for part in extra_parts or []:
+            msg.attach(part)
+        if any(_classify_mime_entity_transport(part) == "8bit" for part in extra_parts or []):
+            # RFC 2045 §6.4: a composite entity whose contents include raw 8-bit
+            # octets must itself declare the 8bit domain. Everything composed here
+            # is base64/quoted-printable, so only a verbatim forwarded part can
+            # widen the domain; without this label the shared transport classifier
+            # would refuse the message as mislabeled instead of using BODY=8BITMIME.
+            # Deriving the label from that same classifier keeps the two rules
+            # from ever disagreeing, without re-serializing any part.
+            msg["Content-Transfer-Encoding"] = "8bit"
+
         return msg
 
     async def _parent_mailboxes(self, imap, mailboxes: tuple[str, ...], *, utf8: bool) -> tuple[str, ...]:
@@ -2408,6 +3393,8 @@ class EmailClient:
         reply_to: str | None = None,
         thread_index: str | None = None,
         mentions: list[str] | None = None,
+        *,
+        extra_parts: list[Message] | None = None,
     ) -> MIMEText | MIMEMultipart:
         """Compose an email message without sending it.
 
@@ -2424,14 +3411,17 @@ class EmailClient:
         placeholders in the HTML/plain-text body are replaced with Outlook-style
         mention markup. Mentioned addresses are automatically added to To when not
         already present in To or Cc.
+        ``extra_parts`` carries already-built MIME parts (a forward's re-attached
+        source parts) into the same multipart container as file attachments. It is
+        keyword-only so existing positional call sites keep their meaning.
         """
         if mentions:
             recipients, cc, body = _apply_mentions(body, html, recipients, cc, mentions)
 
         envelope_sender = self.envelope_sender
 
-        if attachments:
-            msg = self._create_message_with_attachments(body, html, attachments)
+        if attachments or extra_parts:
+            msg = self._create_message_with_attachments(body, html, attachments, extra_parts)
         else:
             content_type = "html" if html else "plain"
             msg = MIMEText(body, content_type, "utf-8")
@@ -2455,11 +3445,13 @@ class EmailClient:
         if bcc and include_bcc_header:
             msg["Bcc"] = _address_header(bcc)
 
-        # Set threading headers for replies
+        # Set threading headers for replies. MCP callers may provide simple
+        # Message-IDs without angle brackets; emit the RFC 5322 msg-id form while
+        # preserving already-delimited and non-simple historical syntax.
         if in_reply_to:
-            msg["In-Reply-To"] = in_reply_to
+            msg["In-Reply-To"] = normalize_thread_message_ids(in_reply_to)
         if references:
-            msg["References"] = references
+            msg["References"] = normalize_thread_message_ids(references)
         if reply_to:
             msg["Reply-To"] = reply_to
 
@@ -2508,6 +3500,8 @@ class EmailClient:
         reply_to: str | None = None,
         thread_index: str | None = None,
         mentions: list[str] | None = None,
+        *,
+        extra_parts: list[Message] | None = None,
     ) -> DeliveryMutationOutcome:
         """Run one SMTP transaction and preserve phase-specific delivery evidence."""
         msg = self.compose_message(
@@ -2524,6 +3518,7 @@ class EmailClient:
             reply_to,
             thread_index,
             mentions,
+            extra_parts=extra_parts,
         )
         all_recipients = [*recipients, *(cc or []), *(bcc or [])]
         envelope_recipients = [email.utils.parseaddr(recipient)[1] for recipient in all_recipients]
@@ -2548,11 +3543,28 @@ class EmailClient:
                         None,
                     )
                 mail_options.append("SMTPUTF8")
-            if smtp.supports_extension("8bitmime"):
-                mail_options.append("BODY=8BITMIME")
             policy = SMTPUTF8_POLICY if utf8_required else SMTP_POLICY
             message_bytes = msg.as_bytes(policy=policy)
-            logger.debug("SMTP phase=message outcome=prepared")
+            data_transport = _classify_smtp_data_transport(msg, message_bytes)
+            if data_transport in ("binary", "invalid"):
+                detail = "smtp-binarymime-unsupported" if data_transport == "binary" else "smtp-mime-transport-invalid"
+                logger.warning("SMTP phase=message outcome=rejected reason={}", detail.removeprefix("smtp-"))
+                return DeliveryMutationOutcome(
+                    tuple(TargetMutationOutcome(target, "failed", detail) for target in all_recipients),
+                    None,
+                )
+            if utf8_required or data_transport == "8bit":
+                if not smtp.supports_extension("8bitmime"):
+                    logger.warning("SMTP phase=message outcome=rejected reason=8bitmime-required")
+                    return DeliveryMutationOutcome(
+                        tuple(
+                            TargetMutationOutcome(target, "failed", "smtp-8bitmime-required")
+                            for target in all_recipients
+                        ),
+                        None,
+                    )
+                mail_options.append("BODY=8BITMIME")
+            logger.debug("SMTP phase=message outcome=prepared transport={}", data_transport)
             if smtp.supports_extension("size"):
                 mail_options.insert(0, f"SIZE={len(message_bytes)}")
 
@@ -2631,6 +3643,14 @@ class EmailClient:
             if not accepted_indexes:
                 return DeliveryMutationOutcome(tuple(item for item in outcomes if item is not None), None)
 
+            try:
+                self._check_mutation_authority()
+            except PermissionError:
+                for accepted_index in accepted_indexes:
+                    outcomes[accepted_index] = TargetMutationOutcome(
+                        all_recipients[accepted_index], "failed", "mutation-policy"
+                    )
+                return DeliveryMutationOutcome(tuple(item for item in outcomes if item is not None), None)
             accepted_status: MutationStatus
             try:
                 await smtp.data(message_bytes)
@@ -2657,9 +3677,14 @@ class EmailClient:
                     all_recipients[accepted_index], accepted_status, accepted_detail
                 )
             delivery_outcomes = tuple(item for item in outcomes if item is not None)
+            accepted_message = msg if accepted_status == "succeeded" else None
+            # Only an accepted DATA phase proves which message the provider took,
+            # so a rejected or ambiguous submission reports no Message-Id at all.
+            accepted_message_id = accepted_message["Message-Id"] if accepted_message is not None else None
             return DeliveryMutationOutcome(
                 delivery_outcomes,
-                msg if accepted_status == "succeeded" else None,
+                accepted_message,
+                message_id=str(accepted_message_id) if accepted_message_id else None,
             )
 
         known_outcome: DeliveryMutationOutcome | None = None
@@ -2890,6 +3915,10 @@ class EmailClient:
                 if _imap_status(select_result) != "OK":
                     continue
                 try:
+                    self._check_mutation_authority()
+                except PermissionError:
+                    return SentCopyMutationOutcome("failed", folder, "mutation-policy")
+                try:
                     append_result = await _append_message(
                         imap,
                         msg,
@@ -2945,6 +3974,7 @@ class EmailClient:
             select_result = await imap.select(_quote_mailbox(mailbox, utf8=append_mode.session_utf8_enabled))
             if _imap_status(select_result) != "OK":
                 return AppendMutationOutcome("failed", message_id, mailbox=mailbox, detail="mailbox-unavailable")
+            self._check_mutation_authority()
             try:
                 append_result = await _append_message(
                     imap,
@@ -3085,7 +4115,11 @@ class EmailClient:
                 store_cancelled = False
                 for index, email_id in enumerate(permitted):
                     try:
+                        self._check_mutation_authority()
                         response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
+                    except PermissionError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "mutation-policy")
+                        continue
                     except asyncio.CancelledError:
                         outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "store-unknown")
                         for remaining_id in permitted[index + 1 :]:
@@ -3109,7 +4143,11 @@ class EmailClient:
                 if pending_expunge and not store_cancelled:
                     expunge_detail = "expunge-unknown"
                     try:
+                        self._check_mutation_authority()
                         response = await imap.uid("expunge", ",".join(pending_expunge))
+                    except PermissionError:
+                        response = None
+                        expunge_detail = "mutation-policy-cleanup-pending"
                     except asyncio.CancelledError:
                         response = None
                     except Exception:
@@ -3158,7 +4196,11 @@ class EmailClient:
                     )
                     continue
                 try:
+                    self._check_mutation_authority()
                     response = await imap.uid("store", email_id, store_operation, formatted_flags)
+                except PermissionError:
+                    outcomes.append(TargetMutationOutcome(email_id, "failed", "mutation-policy"))
+                    continue
                 except asyncio.CancelledError:
                     outcomes.append(TargetMutationOutcome(email_id, "unknown", "store-unknown"))
                     for remaining_id in email_ids[index + 1 :]:
@@ -3192,6 +4234,84 @@ class EmailClient:
             await _best_effort_imap_logout(imap)
         return BatchMutationOutcome(tuple(outcomes))
 
+    async def set_email_tags_with_outcome(  # noqa: C901 - preserve per-UID effect evidence
+        self,
+        email_ids: list[str],
+        operation: Literal["add", "remove"],
+        tags: list[str],
+        mailbox: str = "INBOX",
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
+    ) -> BatchMutationOutcome:
+        """Add or remove explicitly configured writable IMAP keywords."""
+        _validate_imap_uids(email_ids)
+        if operation not in ("add", "remove"):
+            raise ValueError("operation must be 'add' or 'remove'")
+        if not tags or len(tags) > APPLICATION_LIMITS.flags:
+            raise ValueError(f"tags must contain between 1 and {APPLICATION_LIMITS.flags} values")
+        if any(not isinstance(tag, str) for tag in tags):
+            raise ValueError("tags must contain strings")
+        if len(set(tags)) != len(tags):
+            raise ValueError("tags must not contain duplicates")
+        if any(tag.startswith("\\") for tag in tags):
+            raise ValueError("system flags are not valid email tags")
+        formatted_tags = _validate_flags(tags)
+        store_operation = "+FLAGS.SILENT" if operation == "add" else "-FLAGS.SILENT"
+        imap = await self._connect_imap()
+        outcomes: list[TargetMutationOutcome] = []
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            for index, email_id in enumerate(email_ids):
+                if email_id in blocked:
+                    outcomes.append(
+                        TargetMutationOutcome(
+                            email_id,
+                            "failed" if report_blocked_mutations else "succeeded",
+                            "sender-policy" if report_blocked_mutations else None,
+                        )
+                    )
+                    continue
+                try:
+                    self._check_mutation_authority()
+                    response = await imap.uid("store", email_id, store_operation, formatted_tags)
+                    status = _imap_effect_status(response)
+                    outcomes.append(
+                        TargetMutationOutcome(
+                            email_id,
+                            status,
+                            None
+                            if status == "succeeded"
+                            else "tag-store-rejected"
+                            if status == "failed"
+                            else "tag-store-unknown",
+                        )
+                    )
+                except asyncio.CancelledError:
+                    outcomes.append(TargetMutationOutcome(email_id, "unknown", "tag-store-unknown"))
+                    for remaining_id in email_ids[index + 1 :]:
+                        if remaining_id in blocked:
+                            outcomes.append(
+                                TargetMutationOutcome(
+                                    remaining_id,
+                                    "failed" if report_blocked_mutations else "succeeded",
+                                    "sender-policy" if report_blocked_mutations else None,
+                                )
+                            )
+                        else:
+                            outcomes.append(TargetMutationOutcome(remaining_id, "failed", "not-attempted"))
+                    break
+                except PermissionError:
+                    outcomes.append(TargetMutationOutcome(email_id, "failed", "mutation-policy"))
+                except Exception:
+                    outcomes.append(TargetMutationOutcome(email_id, "unknown", "tag-store-unknown"))
+        finally:
+            await _best_effort_imap_logout(imap)
+        return BatchMutationOutcome(tuple(outcomes))
+
     async def mark_emails_as_read_with_outcome(
         self,
         email_ids: list[str],
@@ -3221,6 +4341,7 @@ class EmailClient:
         _validate_imap_uids(email_ids)
         imap = await self._connect_imap()
         outcomes: dict[str, TargetMutationOutcome] = {}
+        interrupted = False
         try:
             await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
@@ -3245,7 +4366,11 @@ class EmailClient:
             elif has_move:
                 for index, email_id in enumerate(permitted):
                     try:
+                        self._check_mutation_authority()
                         response = await imap.uid("move", email_id, _quote_mailbox(destination_mailbox))
+                    except PermissionError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "mutation-policy")
+                        continue
                     except asyncio.CancelledError:
                         outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "move-unknown")
                         for remaining_id in permitted[index + 1 :]:
@@ -3265,39 +4390,44 @@ class EmailClient:
                         else "move-unknown",
                     )
             else:
-                pending_expunge: list[str] = []
-                stopped = False
                 for index, email_id in enumerate(permitted):
                     try:
+                        self._check_mutation_authority()
                         copy_response = await imap.uid("copy", email_id, _quote_mailbox(destination_mailbox))
-                    except asyncio.CancelledError:
+                    except PermissionError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "mutation-policy")
+                        continue
+                    except (asyncio.CancelledError, Exception):
                         outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-unknown")
                         for remaining_id in permitted[index + 1 :]:
                             outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
-                        stopped = True
+                        interrupted = True
                         break
-                    except Exception:
-                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-unknown")
-                        continue
                     copy_status = _imap_effect_status(copy_response)
                     if copy_status != "succeeded":
                         outcomes[email_id] = TargetMutationOutcome(
-                            email_id,
-                            copy_status,
-                            "copy-rejected" if copy_status == "failed" else "copy-unknown",
+                            email_id, copy_status, "copy-rejected" if copy_status == "failed" else "copy-unknown"
                         )
+                        if copy_status == "unknown":
+                            for remaining_id in permitted[index + 1 :]:
+                                outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                            interrupted = True
+                            break
                         continue
                     try:
+                        self._check_mutation_authority()
                         store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
-                    except asyncio.CancelledError:
+                    except PermissionError:
+                        outcomes[email_id] = TargetMutationOutcome(
+                            email_id, "unknown", "copy-succeeded-policy-cleanup-pending"
+                        )
+                        continue
+                    except (asyncio.CancelledError, Exception):
                         outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-succeeded-store-unknown")
                         for remaining_id in permitted[index + 1 :]:
                             outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
-                        stopped = True
+                        interrupted = True
                         break
-                    except Exception:
-                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-succeeded-store-unknown")
-                        continue
                     store_status = _imap_effect_status(store_response)
                     if store_status != "succeeded":
                         outcomes[email_id] = TargetMutationOutcome(
@@ -3307,32 +4437,46 @@ class EmailClient:
                             if store_status == "failed"
                             else "copy-succeeded-store-unknown",
                         )
+                        if store_status == "unknown":
+                            for remaining_id in permitted[index + 1 :]:
+                                outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                            interrupted = True
+                            break
                         continue
-                    pending_expunge.append(email_id)
-                if stopped:
-                    for pending_id in pending_expunge:
-                        outcomes[pending_id] = TargetMutationOutcome(
-                            pending_id, "unknown", "expunge-after-copy-not-attempted"
-                        )
-                elif pending_expunge:
-                    expunge_detail = "expunge-after-copy-unknown"
                     try:
-                        expunge_response = await imap.uid("expunge", ",".join(pending_expunge))
-                    except asyncio.CancelledError:
-                        expunge_response = None
-                    except Exception:
-                        expunge_response = None
+                        self._check_mutation_authority()
+                        expunge_response = await imap.uid("expunge", email_id)
+                    except PermissionError:
+                        outcomes[email_id] = TargetMutationOutcome(
+                            email_id, "unknown", "mutation-policy-cleanup-pending"
+                        )
+                        continue
+                    except (asyncio.CancelledError, Exception):
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "expunge-after-copy-unknown")
+                        for remaining_id in permitted[index + 1 :]:
+                            outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                        interrupted = True
+                        break
+                    expunge_status = _imap_effect_status(expunge_response)
+                    if expunge_status == "succeeded":
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "succeeded")
                     else:
-                        if _imap_effect_status(expunge_response) == "failed":
-                            expunge_detail = "expunge-after-copy-failed"
-                    if expunge_response is not None and _imap_effect_status(expunge_response) == "succeeded":
-                        for email_id in pending_expunge:
-                            outcomes[email_id] = TargetMutationOutcome(email_id, "succeeded")
-                    else:
-                        for email_id in pending_expunge:
-                            outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", expunge_detail)
+                        outcomes[email_id] = TargetMutationOutcome(
+                            email_id,
+                            "unknown",
+                            "expunge-after-copy-failed" if expunge_status == "failed" else "expunge-after-copy-unknown",
+                        )
+                        if expunge_status == "unknown":
+                            for remaining_id in permitted[index + 1 :]:
+                                outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                            interrupted = True
+                            break
         finally:
-            await _best_effort_imap_logout(imap)
+            if interrupted:
+                with suppress(asyncio.CancelledError, Exception):
+                    await self._abort_imap_connection(imap)
+            else:
+                await _best_effort_imap_logout(imap)
         return BatchMutationOutcome(tuple(outcomes[email_id] for email_id in email_ids))
 
     async def delete_emails(
@@ -3549,6 +4693,53 @@ class EmailClient:
 
         return mailboxes
 
+    async def create_mailbox(self, mailbox: str) -> MailboxCreationStatus:
+        """Create one mailbox by exact name; report existence instead of failing.
+
+        The LIST existence check and CREATE share one session so the reported
+        status reflects a single provider view. Once CREATE may have reached the
+        server, interruption is ``unknown`` and is never replayed here.
+        """
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            quoted = _quote_mailbox(mailbox)
+            # An empty LIST pattern discovers the reference namespace's delimiter
+            # even when the requested mailbox does not exist (RFC 3501 6.3.8).
+            hierarchy = await imap.list(quoted, '""')  # pyright: ignore[reportArgumentType]
+            _raise_for_imap_error(hierarchy, "LIST mailbox hierarchy before CREATE")
+            roots = _parse_list_responses(hierarchy[1])
+            if len(roots) != 1:
+                raise RuntimeError("LIST mailbox hierarchy returned no unique delimiter")
+            delimiter = roots[0].delimiter
+            if delimiter and mailbox.endswith(delimiter):
+                raise ValueError("mailbox must not end with the server's hierarchy delimiter")
+            response = await imap.list('""', quoted)  # pyright: ignore[reportArgumentType]
+            _raise_for_imap_error(response, "LIST mailbox before CREATE")
+            for existing in _parse_list_responses(response[1]):
+                # \Noselect/\NonExistent entries are hierarchy placeholders, not
+                # mailboxes; CREATE is what turns them into real ones.
+                if any(flag.casefold() in (r"\noselect", r"\nonexistent") for flag in existing.flags):
+                    continue
+                if existing.name == mailbox or existing.name.casefold() == "inbox" == mailbox.casefold():
+                    return "already_exists"
+            self._check_mutation_authority()
+            try:
+                created = await imap.create(quoted)
+            except Exception:
+                return "unknown"
+            status = _imap_effect_status(created)
+            if status == "succeeded":
+                return "created"
+            if status == "failed":
+                if _has_already_exists_code(created):
+                    return "already_exists"
+                raise RuntimeError(f"CREATE mailbox failed ({_imap_status(created)})")
+            return "unknown"
+        finally:
+            await _best_effort_imap_logout(imap)
+
 
 def _address_header(addresses: list[str]) -> str:
     """Encode each display name on its own: a non-ASCII name in a joined value
@@ -3582,12 +4773,14 @@ class ClassicEmailHandler(EmailHandler):
             email_settings.incoming,
             sender_name=email_settings.full_name,
             sender_address=email_settings.email_address,
+            imap_non_ascii_search=email_settings.imap_non_ascii_search,
         )
         self.outgoing_client = (
             EmailClient(
                 email_settings.outgoing,
                 sender_name=email_settings.full_name,
                 sender_address=email_settings.email_address,
+                imap_non_ascii_search=email_settings.imap_non_ascii_search,
             )
             if email_settings.outgoing
             else None
@@ -3865,6 +5058,22 @@ class ClassicEmailHandler(EmailHandler):
             allowed_senders=settings.allowed_senders,
             report_blocked_mutations=settings.report_blocked_mutations,
         )
+
+    async def _find_junk_folder(self) -> str | None:
+        """Find one selectable Junk mailbox; never choose by LIST order."""
+        mailboxes = await self.incoming_client.list_mailboxes()
+        selectable = [
+            mailbox for mailbox in mailboxes if not any(flag.casefold() == r"\noselect" for flag in mailbox.flags)
+        ]
+        candidates = [
+            mailbox.name for mailbox in selectable if any(flag.casefold() == r"\junk" for flag in mailbox.flags)
+        ]
+        if not candidates:
+            common_names = {name.casefold() for name in _JUNK_FOLDER_CANDIDATES}
+            candidates = [mailbox.name for mailbox in selectable if mailbox.name.casefold() in common_names]
+        if len(candidates) > 1:
+            raise ValueError("Junk mailbox is ambiguous; use list_mailboxes and specify destination_mailbox")
+        return candidates[0] if candidates else None
 
     async def _find_archive_folder(self) -> str | None:
         """Locate the Archive folder via the RFC 6154 ``\\Archive`` flag, then common names."""

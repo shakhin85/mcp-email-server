@@ -74,7 +74,7 @@ async def _run(
             await handler.save_to_mailbox(to, "S", body, html=html, attachments=attachments, in_reply_to=in_reply_to)
         else:
             provider = ClassicMutationProvider(handler)
-            account = MutationAccountSnapshot("acc", "legacy", (), (), False)
+            account = MutationAccountSnapshot("acc", "legacy", (), (), False, can_send=True)
             common = {"html": html, "attachments": tuple(attachments or ()), "in_reply_to": in_reply_to}
             if path == "adapter_send":
                 await provider.send(SendCommand("acc", tuple(to), "S", body, **common), account)

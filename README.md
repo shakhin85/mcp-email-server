@@ -95,9 +95,12 @@ Ask the client to list the configured email accounts or recent messages.
 ## Other configuration methods
 
 For the SQLite-backed managed CLI workflow, Windows and POSIX storage boundaries,
-headless environments, containers, multiple accounts, custom TLS settings, and
+headless environments, multiple accounts, custom TLS settings, and
 environment-variable configuration, see the
-[documentation](https://mcp-email-server.wh1isper.top/).
+[documentation](https://mcp-email-server.wh1isper.top/). Release 1.6.2 and later
+also publish Linux `amd64`/`arm64` images at
+`ghcr.io/wh1isper/mcp-email-server`; see the
+[container instructions](https://mcp-email-server.wh1isper.top/getting-started/#run-the-official-container-image).
 Per-account HTML paragraph style and signature are described in [Configuration](https://mcp-email-server.wh1isper.top/configuration/#html-body-style-and-signature).
 
 ## Documentation

@@ -1,20 +1,25 @@
 import json
+import re
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from mcp.types import TextContent
+from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, TextContent
 
 from mcp_email_server import app as app_module
 from mcp_email_server.app import (
     archive_emails,
     delete_emails,
     download_attachment,
+    forward_email,
+    get_attachment_content,
     get_emails_content,
     list_allowed_recipients,
     list_allowed_senders,
     list_available_accounts,
+    list_email_tags,
     list_emails_metadata,
     list_mailboxes,
     mark_emails_as_read,
@@ -22,19 +27,24 @@ from mcp_email_server.app import (
     save_to_mailbox,
     send_email,
     set_email_flags,
+    set_email_tags,
 )
+from mcp_email_server.application import limits as limits_module
 from mcp_email_server.application.accounts import AvailableAccount, EffectiveConfiguration
 from mcp_email_server.application.limits import APPLICATION_LIMITS
 from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
     ArchiveMutationOutcome,
     BatchMutationOutcome,
+    MoveMutationOutcome,
     RecipientPolicyDeniedError,
     SendMutationOutcome,
     SentCopyMutationOutcome,
     SetEmailFlagsCommand,
+    SetEmailTagsCommand,
     TargetMutationOutcome,
 )
+from mcp_email_server.application.reads import AttachmentPayload
 from mcp_email_server.config import EmailServer, EmailSettings, ProviderSettings
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
@@ -44,6 +54,10 @@ from mcp_email_server.emails.models import (
     EmailMetadataPageResponse,
     MailboxInfo,
 )
+from mcp_email_server.imap_keywords import ImapKeywordTag
+
+# RFC 5322 msg-id shape, as an external journal would look for it in the response.
+_MESSAGE_ID_PATTERN = re.compile(r"<[^<>@\s]+@[^<>@\s]+>")
 
 
 def _batch_outcome(
@@ -387,6 +401,8 @@ class TestMcpTools:
         for properties in tools.values():
             account_name = properties.get("account_name")
             if account_name is not None:
+                if "anyOf" in account_name:
+                    account_name = next(item for item in account_name["anyOf"] if item.get("type") == "string")
                 assert account_name["maxLength"] == APPLICATION_LIMITS.account_name_bytes
 
         content_ids = tools["get_emails_content"]["email_ids"]
@@ -410,6 +426,17 @@ class TestMcpTools:
         assert send["attachments"]["anyOf"][0]["items"]["maxLength"] == APPLICATION_LIMITS.attachment_path_bytes
         assert send["subject"]["maxLength"] == APPLICATION_LIMITS.subject_bytes
         assert send["body"]["maxLength"] == APPLICATION_LIMITS.body_bytes
+        forward = tools["forward_email"]
+        assert forward["email_id"]["maxLength"] == len(str(APPLICATION_LIMITS.maximum_imap_uid))
+        assert forward["recipients"]["maxItems"] == APPLICATION_LIMITS.recipients
+        assert forward["recipients"]["items"]["maxLength"] == APPLICATION_LIMITS.address_bytes
+        for addresses in ("cc", "bcc"):
+            assert forward[addresses]["anyOf"][0]["maxItems"] == APPLICATION_LIMITS.recipients
+            assert forward[addresses]["anyOf"][0]["items"]["maxLength"] == APPLICATION_LIMITS.address_bytes
+        assert forward["source_mailbox"]["maxLength"] == APPLICATION_LIMITS.mailbox_bytes
+        assert forward["body"]["maxLength"] == APPLICATION_LIMITS.body_bytes
+        # The subject is derived from the source message, so the tool exposes no subject input.
+        assert "subject" not in forward
         flags = tools["save_to_mailbox"]["flags"]["anyOf"][0]
         assert flags["maxItems"] == APPLICATION_LIMITS.flags
         assert flags["items"]["maxLength"] == APPLICATION_LIMITS.flag_bytes
@@ -418,6 +445,12 @@ class TestMcpTools:
         assert mutable_flags["maxItems"] == 4
         assert mutable_flags["items"]["enum"] == [r"\Seen", r"\Flagged", r"\Answered", r"\Draft"]
         assert tools["set_email_flags"]["operation"]["enum"] == ["add", "remove"]
+        metadata = tools["list_emails_metadata"]
+        assert "semantic_tags" in metadata
+        assert "provider_keywords" not in metadata
+        mutable_tags = tools["set_email_tags"]
+        assert mutable_tags["operation"]["enum"] == ["add", "remove"]
+        assert mutable_tags["tags"]["minItems"] == 1
 
     @pytest.mark.asyncio
     async def test_send_email(self):
@@ -635,7 +668,9 @@ class TestMcpTools:
 
     @pytest.mark.asyncio
     async def test_move_emails(self):
-        command_handler = AsyncMock(return_value=_batch_outcome(succeeded=("12345", "12346")))
+        command_handler = AsyncMock(
+            return_value=MoveMutationOutcome(_batch_outcome(succeeded=("12345", "12346")), "Archive")
+        )
         with patch("mcp_email_server.app.move_emails_command", command_handler):
             result = await move_emails("test_account", ["12345", "12346"], "Archive")
         assert result == "Successfully moved 2 email(s) to Archive"
@@ -664,7 +699,7 @@ class TestMcpTools:
 
     @pytest.mark.asyncio
     async def test_move_emails_with_source_mailbox(self):
-        command_handler = AsyncMock(return_value=_batch_outcome(succeeded=("12345",)))
+        command_handler = AsyncMock(return_value=MoveMutationOutcome(_batch_outcome(succeeded=("12345",)), "INBOX"))
         with patch("mcp_email_server.app.move_emails_command", command_handler):
             result = await move_emails("test_account", ["12345"], "INBOX", "Trash")
         assert result == "Successfully moved 1 email(s) to INBOX"
@@ -672,7 +707,9 @@ class TestMcpTools:
 
     @pytest.mark.asyncio
     async def test_move_emails_with_failures(self):
-        command_handler = AsyncMock(return_value=_batch_outcome(succeeded=("12345",), failed=("12346", "12347")))
+        command_handler = AsyncMock(
+            return_value=MoveMutationOutcome(_batch_outcome(succeeded=("12345",), failed=("12346", "12347")), "Archive")
+        )
         with patch("mcp_email_server.app.move_emails_command", command_handler):
             result = await move_emails("test_account", ["12345", "12346", "12347"], "Archive")
         assert result == "Move result [succeeded: 12345; failed: 12346, 12347]"
@@ -972,6 +1009,149 @@ async def test_send_tool_preserves_recipient_order_across_status_tags() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "detail",
+    ("smtp-8bitmime-required", "smtp-binarymime-unsupported", "smtp-mime-transport-invalid"),
+)
+async def test_send_tool_reports_safe_transport_rejection(detail: str) -> None:
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "failed", detail),),
+            SentCopyMutationOutcome("skipped"),
+        )
+    )
+    with patch("mcp_email_server.app.send_email_command", command_handler):
+        result = await send_email("test", ["recipient@example.test"], "Subject", "body")
+
+    assert result == f"Email delivery [failed: recipient@example.test ({detail}); sent-copy: skipped]"
+
+
+@pytest.mark.asyncio
+async def test_forward_tool_dispatches_source_selection_and_reports_success() -> None:
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (
+                TargetMutationOutcome("recipient@example.test", "succeeded"),
+                TargetMutationOutcome("cc@example.test", "succeeded"),
+            ),
+            SentCopyMutationOutcome("succeeded", "Sent", "append"),
+        )
+    )
+    with patch("mcp_email_server.app.forward_email_command", command_handler):
+        result = await forward_email(
+            account_name="test_account",
+            email_id="12345",
+            recipients=["recipient@example.test"],
+            source_mailbox="Archive",
+            body="please review",
+            cc=["cc@example.test"],
+            include_attachments=False,
+        )
+
+    assert result == "Email forwarded successfully to recipient@example.test"
+    command = command_handler.await_args.args[0]
+    assert command.account_name == "test_account"
+    assert command.source_email_id == "12345"
+    assert command.source_mailbox == "Archive"
+    assert command.recipients == ("recipient@example.test",)
+    assert command.cc == ("cc@example.test",)
+    assert command.bcc == ()
+    assert command.body == "please review"
+    assert command.include_attachments is False
+    # The forwarded subject is derived from the source message by the application layer.
+    assert command.subject == ""
+
+
+@pytest.mark.asyncio
+async def test_forward_tool_defaults_to_inbox_with_no_note_and_attachments_retained() -> None:
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "succeeded"),),
+            SentCopyMutationOutcome("skipped"),
+        )
+    )
+    with patch("mcp_email_server.app.forward_email_command", command_handler):
+        await forward_email("test_account", "12345", ["recipient@example.test"])
+
+    command = command_handler.await_args.args[0]
+    assert command.source_mailbox == "INBOX"
+    assert command.body == ""
+    assert command.include_attachments is True
+
+
+@pytest.mark.asyncio
+async def test_forward_tool_reports_partial_delivery_and_sent_copy_separately() -> None:
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (
+                TargetMutationOutcome("first@example.test", "succeeded"),
+                TargetMutationOutcome("second@example.test", "failed", "smtp-recipient-rejected"),
+                TargetMutationOutcome("third@example.test", "unknown", "provider-timeout"),
+            ),
+            SentCopyMutationOutcome("failed", "Sent", "append"),
+        )
+    )
+    with patch("mcp_email_server.app.forward_email_command", command_handler):
+        result = await forward_email(
+            "test_account",
+            "12345",
+            ["first@example.test", "second@example.test", "third@example.test"],
+        )
+
+    assert result == (
+        "Email forward [succeeded: first@example.test; failed: second@example.test (smtp-recipient-rejected); "
+        "unknown: third@example.test (provider-timeout); sent-copy: failed (Sent); "
+        "warning: reconciliation needed]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_forward_tool_maps_application_recipient_denial() -> None:
+    command_handler = AsyncMock(side_effect=RecipientPolicyDeniedError("recipient denied"))
+    with patch("mcp_email_server.app.forward_email_command", command_handler):
+        with pytest.raises(ValueError, match="Recipient\\(s\\) not in allowlist"):
+            await forward_email("test_account", "12345", ["mallory@evil.test"])
+
+
+@pytest.mark.asyncio
+async def test_forward_tool_does_not_expose_unrecognized_provider_detail() -> None:
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "failed", "private provider response"),),
+            SentCopyMutationOutcome("skipped"),
+        )
+    )
+    with patch("mcp_email_server.app.forward_email_command", command_handler):
+        result = await forward_email("test_account", "12345", ["recipient@example.test"])
+
+    assert result == "Email forward [failed: recipient@example.test; sent-copy: skipped]"
+    assert "private provider response" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", [send_email, forward_email])
+async def test_send_tools_surface_the_8bitmime_rejection_cause(tool) -> None:
+    """A forwarded 8-bit part refused before MAIL must not read as a causeless failure."""
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "failed", "smtp-8bitmime-required"),),
+            SentCopyMutationOutcome("skipped"),
+        )
+    )
+    arguments = (
+        ("test_account", ["recipient@example.test"], "Subject", "body")
+        if tool is send_email
+        else ("test_account", "12345", ["recipient@example.test"])
+    )
+    command_name = "send_email_command" if tool is send_email else "forward_email_command"
+    with patch(f"mcp_email_server.app.{command_name}", command_handler):
+        result = await tool(*arguments)
+
+    assert "(smtp-8bitmime-required)" in result
+    assert result.endswith("failed: recipient@example.test (smtp-8bitmime-required); sent-copy: skipped]")
+
+
+@pytest.mark.asyncio
 async def test_send_tool_does_not_expose_unrecognized_provider_detail() -> None:
     command_handler = AsyncMock(
         return_value=SendMutationOutcome(
@@ -1012,6 +1192,102 @@ async def test_send_tool_reports_safe_internationalized_sent_copy_failure() -> N
         result = await send_email("test", ["recipient@example.test"], "Subject", "body")
 
     assert result == ("Email delivery [succeeded: recipient@example.test; sent-copy: failed (utf8-append-unsupported)]")
+
+
+@pytest.mark.asyncio
+async def test_send_tool_names_the_delivered_message_id() -> None:
+    """A caller that journals the send can only cite an identifier the tool actually reports."""
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "succeeded"),),
+            SentCopyMutationOutcome("succeeded", "Sent"),
+            message_id="<delivered.1@example.test>",
+        )
+    )
+    with patch("mcp_email_server.app.send_email_command", command_handler):
+        result = await send_email("test", ["recipient@example.test"], "Subject", "body")
+
+    assert result == "Email sent successfully to recipient@example.test. Message-Id: <delivered.1@example.test>"
+    assert _MESSAGE_ID_PATTERN.search(result) is not None
+
+
+@pytest.mark.asyncio
+async def test_send_tool_names_the_message_id_of_a_partially_delivered_message() -> None:
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (
+                TargetMutationOutcome("accepted@example.test", "succeeded"),
+                TargetMutationOutcome("rejected@example.test", "failed", "smtp-recipient-rejected"),
+            ),
+            SentCopyMutationOutcome("succeeded", "Sent"),
+            message_id="<delivered.2@example.test>",
+        )
+    )
+    with patch("mcp_email_server.app.send_email_command", command_handler):
+        result = await send_email(
+            "test",
+            ["accepted@example.test", "rejected@example.test"],
+            "Subject",
+            "body",
+        )
+
+    assert result == (
+        "Email delivery [succeeded: accepted@example.test; "
+        "failed: rejected@example.test (smtp-recipient-rejected); "
+        "message-id: <delivered.2@example.test>; sent-copy: succeeded (Sent)]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_tool_does_not_invent_a_message_id_for_an_ambiguous_delivery() -> None:
+    """An unknown SMTP outcome must leave the journal empty rather than fabricate an identifier."""
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "unknown", "smtp-data-unknown"),),
+            SentCopyMutationOutcome("skipped"),
+        )
+    )
+    with patch("mcp_email_server.app.send_email_command", command_handler):
+        result = await send_email("test", ["recipient@example.test"], "Subject", "body")
+
+    assert result == (
+        "Email delivery [unknown: recipient@example.test (smtp-data-unknown); sent-copy: skipped; "
+        "warning: reconciliation needed]"
+    )
+    assert _MESSAGE_ID_PATTERN.search(result) is None
+
+
+@pytest.mark.asyncio
+async def test_forward_tool_names_the_delivered_message_id() -> None:
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "succeeded"),),
+            SentCopyMutationOutcome("succeeded", "Sent"),
+            message_id="<forwarded.1@example.test>",
+        )
+    )
+    with patch("mcp_email_server.app.forward_email_command", command_handler):
+        result = await forward_email("test_account", "12345", ["recipient@example.test"])
+
+    assert result == "Email forwarded successfully to recipient@example.test. Message-Id: <forwarded.1@example.test>"
+
+
+@pytest.mark.asyncio
+async def test_forward_tool_does_not_invent_a_message_id_for_an_ambiguous_delivery() -> None:
+    command_handler = AsyncMock(
+        return_value=SendMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "unknown", "provider-timeout"),),
+            SentCopyMutationOutcome("skipped"),
+        )
+    )
+    with patch("mcp_email_server.app.forward_email_command", command_handler):
+        result = await forward_email("test_account", "12345", ["recipient@example.test"])
+
+    assert result == (
+        "Email forward [unknown: recipient@example.test (provider-timeout); sent-copy: skipped; "
+        "warning: reconciliation needed]"
+    )
+    assert _MESSAGE_ID_PATTERN.search(result) is None
 
 
 @pytest.mark.asyncio
@@ -1110,6 +1386,13 @@ async def test_tool_annotations_expose_agent_safety_and_retry_hints() -> None:
         "idempotentHint": False,
         "openWorldHint": True,
     }
+    assert tools["forward_email"].annotations is not None
+    assert tools["forward_email"].annotations.model_dump(exclude_none=True) == {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
     assert tools["delete_emails"].annotations is not None
     assert tools["delete_emails"].annotations.model_dump(exclude_none=True) == {
         "readOnlyHint": False,
@@ -1118,3 +1401,130 @@ async def test_tool_annotations_expose_agent_safety_and_retry_hints() -> None:
         "openWorldHint": True,
     }
     assert all(tool.annotations is not None for tool in tools.values())
+
+
+@pytest.mark.asyncio
+async def test_list_email_tags_returns_account_scoped_semantic_config() -> None:
+    tags = (
+        ImapKeywordTag(name="todo", keyword="$label4"),
+        ImapKeywordTag(name="review", keyword="Review", description="Needs review", writable=True),
+    )
+    runtime = MagicMock()
+    runtime.metadata.list_tags.return_value = tags
+
+    with patch("mcp_email_server.app.get_application_runtime", return_value=runtime):
+        result = await list_email_tags("work")
+
+    assert result == list(tags)
+    runtime.metadata.list_tags.assert_called_once_with("work")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["add", "remove"])
+async def test_set_email_tags_maps_semantic_add_remove_command(operation: str) -> None:
+    command_handler = AsyncMock(return_value=_batch_outcome(succeeded=("1",)))
+    with patch("mcp_email_server.app.set_email_tags_command", command_handler):
+        result = await set_email_tags("work", ["1"], operation, ["todo"], mailbox="Archive")
+
+    action = "added" if operation == "add" else "removed"
+    assert result == f"Successfully {action} configured tags on 1 email(s)"
+    assert command_handler.await_args.args[0] == SetEmailTagsCommand(
+        account_name="work",
+        email_ids=("1",),
+        operation=operation,
+        tags=("todo",),
+        mailbox="Archive",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_attachment_content_returns_one_content_only_opaque_blob_resource() -> None:
+    payload = AttachmentPayload("7", "report.pdf", "application/pdf", b"pdf-bytes")
+    command_handler = AsyncMock(return_value=payload)
+    with (
+        patch("mcp_email_server.app.get_attachment_content_command", command_handler),
+        patch("mcp_email_server.app.secrets.token_urlsafe", return_value="opaque-token"),
+    ):
+        result = await get_attachment_content("work", "7", "report.pdf", mailbox="Archive")
+
+    assert isinstance(result, CallToolResult)
+    assert result.structuredContent is None
+    assert len(result.content) == 1
+    embedded = result.content[0]
+    assert isinstance(embedded, EmbeddedResource)
+    assert isinstance(embedded.resource, BlobResourceContents)
+    assert str(embedded.resource.uri) == "email-attachment://content/opaque-token"
+    assert all(value not in str(embedded.resource.uri) for value in ("work", "Archive", "report.pdf"))
+    assert embedded.resource.mimeType == "application/pdf"
+    assert embedded.resource.blob == "cGRmLWJ5dGVz"
+    assert embedded.meta == {"filename": "report.pdf", "size": 9}
+    command = command_handler.await_args.args[0]
+    assert command.save_path is None
+    assert command.mailbox == "Archive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("ceiling_delta", "valid"), [(0, True), (-1, False)])
+async def test_get_attachment_content_enforces_global_serialized_result_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    ceiling_delta: int,
+    valid: bool,
+) -> None:
+    payload = AttachmentPayload("7", "report.pdf", "application/pdf", b"pdf-bytes")
+    resource = BlobResourceContents.model_validate({
+        "uri": "email-attachment://content/opaque-token",
+        "mimeType": payload.mime_type,
+        "blob": "cGRmLWJ5dGVz",
+    })
+    expected = CallToolResult(
+        content=[
+            EmbeddedResource.model_validate({
+                "type": "resource",
+                "resource": resource,
+                "_meta": {"filename": payload.attachment_name, "size": len(payload.content)},
+            })
+        ]
+    )
+    serialized_size = len(expected.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+    monkeypatch.setattr(
+        limits_module,
+        "APPLICATION_LIMITS",
+        replace(APPLICATION_LIMITS, serialized_response_bytes=serialized_size + ceiling_delta),
+    )
+
+    with (
+        patch("mcp_email_server.app.get_attachment_content_command", AsyncMock(return_value=payload)),
+        patch("mcp_email_server.app.secrets.token_urlsafe", return_value="opaque-token"),
+    ):
+        if valid:
+            assert await get_attachment_content("work", "7", "report.pdf") == expected
+        else:
+            with pytest.raises(ValueError, match="global result limit"):
+                await get_attachment_content("work", "7", "report.pdf")
+
+
+@pytest.mark.asyncio
+async def test_attachment_blob_survives_fastmcp_tool_adapter_without_structured_content() -> None:
+    payload = AttachmentPayload("7", "photo.png", "image/png", b"png")
+    with patch(
+        "mcp_email_server.app.get_attachment_content_command",
+        AsyncMock(return_value=payload),
+    ):
+        result = await app_module.mcp.call_tool(
+            "get_attachment_content",
+            {
+                "account_name": "work",
+                "email_id": "7",
+                "attachment_name": "photo.png",
+                "mailbox": "INBOX",
+            },
+        )
+
+    assert isinstance(result, CallToolResult)
+    assert result.structuredContent is None
+    assert len(result.content) == 1
+    embedded = result.content[0]
+    assert isinstance(embedded, EmbeddedResource)
+    assert isinstance(embedded.resource, BlobResourceContents)
+    assert embedded.resource.blob == "cG5n"
+    assert embedded.meta == {"filename": "photo.png", "size": 3}

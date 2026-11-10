@@ -47,11 +47,12 @@ Or configure one through environment variables without
 }
 ```
 
-`send_email` remains in the static MCP tool list, but calling it for this
-account fails its SMTP capability check before provider access. IMAP mutation
+`send_email` and `forward_email` remain in the static MCP tool list, but
+calling either for this account fails its SMTP capability check before provider
+access — for a forward, before the source message is read. IMAP mutation
 tools remain available, so this is not a strict read-only mode. To limit
-mutations, also constrain which MCP tools the client may call or run the server
-with an account whose provider permissions are read-only.
+mutations, set `allowed_mutations = []` globally or on the account. Omitted
+settings retain read/write access; an account null/omitted override inherits.
 
 ## Safe delete and move behavior
 
@@ -64,6 +65,55 @@ If a provider lacks `UIDPLUS`, `delete_emails` reports the requested messages as
 failed before changing their flags. When the provider also lacks native `MOVE`,
 `move_emails` rejects its COPY-and-delete fallback before copying anything. Use
 the provider's own client or an IMAP server that supports `MOVE` or `UIDPLUS`.
+
+## Move suspected spam to Junk and restore it
+
+Use `move_emails` for both directions; this requires `organize` permission.
+First list messages in the source mailbox. For a UID listed in `INBOX`, call:
+
+```json
+{
+  "account_name": "work",
+  "email_ids": ["42"],
+  "source_mailbox": "INBOX",
+  "destination_role": "junk"
+}
+```
+
+Do not also pass `destination_mailbox`. The result names the resolved folder,
+which may be localized rather than named `Junk`. If discovery is missing or
+ambiguous, inspect `list_mailboxes` and use an exact `destination_mailbox`
+instead. See [Junk discovery](tools.md#move_emails) for the selection rules.
+
+To restore, list messages again in that resolved folder. If the newly listed
+UID is `73` and the folder was `Junk`, call:
+
+```json
+{
+  "account_name": "work",
+  "email_ids": ["73"],
+  "source_mailbox": "Junk",
+  "destination_mailbox": "INBOX"
+}
+```
+
+The example UIDs are illustrative; use values from the actual source listing,
+not the old pre-move UID. The caller decides whether a message is spam. These
+calls request mailbox moves and do not guarantee service-provider training or
+reporting. Inspect partial/unknown results before deciding what to do next;
+never replay an ambiguous move automatically.
+
+## Create a folder and file messages into it
+
+1. Call `list_mailboxes` and note the hierarchy delimiter and any `INBOX.` prefix.
+2. Call `create_mailbox` with the exact name, such as `business/techem`, without
+   a trailing hierarchy delimiter. This requires `organize` permission. Repeating the call is safe and reports
+   `already_exists`.
+3. Move messages there with `move_emails` and an explicit `destination_mailbox`.
+
+If the provider does not create missing parent levels, create the parent first
+(`business`) and then the child. See [`create_mailbox`](tools.md#create_mailbox)
+for result statuses.
 
 ## ProtonMail Bridge and self-signed TLS
 
@@ -168,23 +218,27 @@ and a second IMAP append would create duplicates.
 
 ## Save a draft
 
-Call `save_to_mailbox` with the account and message fields. The default mailbox
-is `Drafts`, and the default flags are `\Draft` and `\Seen`.
+Call `save_draft` with the account and compose fields. It requires `draft` and
+uses the configured `drafts_mailbox` or the unique special-use `\Drafts`
+mailbox, with only the `\Draft` flag. There is no mailbox or flags parameter.
+Use `recipients=[]` for an unfinished recipientless draft; any supplied To/CC/BCC
+recipient must match the allowlist. For explicit placement and flags, use
+`save_to_mailbox` with `append` permission instead.
 
 Conceptual MCP call:
 
 ```python
-await save_to_mailbox(
+await save_draft(
     account_name="work",
     recipients=["alice@example.com"],
     subject="Project update",
     body="Draft content",
-    mailbox="Drafts",
 )
 ```
 
-Mailbox names vary by provider. Use `list_mailboxes` first when `Drafts` is not
-the correct name. If any address or thread-header identifier requires
+Mailbox names vary by provider. If special-use discovery is missing or
+ambiguous, use `list_mailboxes` and set the exact existing `drafts_mailbox` on
+the account; the draft tool never guesses or creates a mailbox. If any address or thread-header identifier requires
 internationalized syntax, the IMAP endpoint must support RFC 6855
 `ENABLE`/`UTF8=ACCEPT`; otherwise the save fails before mailbox selection with
 `utf8-append-unsupported` and is not retried.
@@ -205,11 +259,7 @@ Build the ancestor chain from the returned `references` value and the immediate
 parent's `message_id`, then send the reply:
 
 ```python
-references = " ".join(
-    value
-    for value in (original.references, original.message_id)
-    if value
-) or None
+references = " ".join(value for value in (original.references, original.message_id) if value) or None
 
 await send_email(
     account_name="work",
@@ -222,10 +272,46 @@ await send_email(
 ```
 
 `in_reply_to` and `references` are nullable because not every message belongs to
-a thread or has a valid Message-ID. The server returns `references` as one
+a thread or has a valid Message-ID. Simple Message-IDs may be supplied bare or
+inside angle brackets; the compose path adds missing brackets to each simple ID
+and preserves already bracketed values. The server returns `references` as one
 whitespace-normalized string rather than guessing how to tokenize malformed or
 historical header syntax. Treat both values as untrusted observations: compose
-validation rejects malformed values containing control characters.
+validation rejects malformed values containing control characters, and unusual
+legacy syntax is preserved rather than partially rewritten.
+
+## Forward a message with its attachments
+
+Locate the message with `list_emails_metadata`, then forward it by UID. The
+subject and the quoted content are derived from the source message, so the
+caller supplies only the note that goes above them:
+
+```python
+await forward_email(
+    account_name="work",
+    email_id="123",
+    source_mailbox="INBOX",
+    recipients=["alice@example.com"],
+    body="Forwarding this for your records; the signed contract is attached.",
+)
+```
+
+The delivered subject becomes `Fwd: <original subject>`, and the original's
+attachments are re-attached with their MIME types and parameters preserved. Pass
+`include_attachments=False` to forward only the text.
+
+The quoted block is rebuilt from the parsed plain-text body, so an HTML-heavy
+original arrives without its formatting. Nothing is silently truncated: the
+composed body, note included, is bounded at 1 MiB, and a forward that exceeds it
+is rejected rather than trimmed. When the recipient needs the message exactly as
+it was sent, save the parts with `download_attachment` and compose the message
+yourself with `send_email`.
+
+Forwarding requires SMTP, so it fails its capability check for an
+[IMAP-only account](#imap-only-accounts). If the source message cannot be read,
+including when a sender allowlist hides it, the call fails before any SMTP
+session is opened, so a forward is never sent without the attachments it was
+supposed to carry.
 
 ## Read a long message in chunks
 
@@ -250,6 +336,38 @@ second = await get_emails_content(
 
 Keep the mailbox argument consistent with the mailbox used to obtain the
 `email_id`.
+
+## Work with semantic email tags
+
+Start by calling `list_email_tags(account_name="work")`. A request such as
+“messages requiring an action” can then resolve to the configured `todo` name.
+Filter with `list_emails_metadata(semantic_tags=["todo"], tag_match="all")`.
+Add or remove the tag with
+`set_email_tags(email_ids=["123"], operation="add", tags=["todo"])` or
+`operation="remove"`. Tool inputs use semantic names only, and mutation requires
+the configured tag to have `writable=true`.
+
+## Return attachments to ChatGPT or another remote MCP app
+
+A remote ChatGPT app or custom MCP client does not share the server's filesystem.
+A path returned by `download_attachment` therefore remains a path on the machine
+running `mcp-email-server`; it is not an attachment the remote client can read.
+
+For that setup, expose the server through the HTTPS transport expected by the
+client, or through a trusted secure MCP tunnel, and explicitly enable attachment
+content transfer:
+
+```toml
+enable_attachment_content = true
+```
+
+In managed mode, enable **Allow attachments to be returned through MCP** in the
+local management UI instead. Then call `get_attachment_content` with the message
+ID and filename returned by `get_emails_content`. The tool returns the attachment
+as one embedded binary resource without creating a local file. This setting is
+independent of `enable_attachment_download`; enable only the mode your client
+uses. The complete encoded result must fit the server's existing global result
+ceiling.
 
 ## Import legacy accounts into a managed catalog
 

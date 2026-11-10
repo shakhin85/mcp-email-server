@@ -12,6 +12,7 @@ from mcp_email_server.app import save_to_mailbox, send_email
 from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
     DeliveryMutationOutcome,
+    MutationAccountSnapshot,
     SaveToMailboxCommand,
     SendCommand,
     SendMutationOutcome,
@@ -123,7 +124,7 @@ async def test_provider_marks_saved_draft_when_parent_missing() -> None:
     ):
         outcome = await ClassicMutationProvider(handler).save_to_mailbox(
             SaveToMailboxCommand("primary", ("to@example.test",), "Re: x", "Body", in_reply_to=PARENT_ID),
-            Mock(),
+            MutationAccountSnapshot("primary", "legacy", (), (), False, can_send=True),
         )
 
     assert outcome.parent_missing is True
@@ -139,7 +140,7 @@ async def test_provider_marks_delivery_when_parent_missing() -> None:
     ):
         outcome = await ClassicMutationProvider(handler).send(
             SendCommand("primary", ("to@example.test",), "Re: x", "Body", in_reply_to=PARENT_ID),
-            Mock(),
+            MutationAccountSnapshot("primary", "legacy", (), (), False, can_send=True),
         )
 
     assert outcome.parent_missing is True

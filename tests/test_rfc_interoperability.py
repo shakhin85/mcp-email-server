@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import codecs
+import encodings.big5
+import encodings.gb2312
+import encodings.gbk
 import re
+import subprocess
+import sys
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from email.parser import Parser
@@ -13,6 +20,7 @@ import aioimaplib
 import pytest
 from aiosmtplib.errors import SMTPNotSupported
 
+from mcp_email_server.emails import charsets
 from mcp_email_server.emails.classic import (
     EmailClient,
     ImapTransportError,
@@ -20,6 +28,7 @@ from mcp_email_server.emails.classic import (
     _ImapAppendMode,
     _ImapSearchLiteral,
     _message_requires_smtputf8,
+    _normalize_search_uids,
     _parse_list_responses,
     _uid_search,
     _validate_flags,
@@ -97,6 +106,153 @@ def test_unknown_single_part_charset_falls_back_without_losing_message(rfc_email
     assert parsed["subject"] == "Unknown charset"
     assert parsed["body"] == "hello �"
     assert parsed["to"] == ["recipient@example.test"]
+
+
+def _strict(text: str, codec: str) -> bytes:
+    # Encode with the strict codec modules so fixtures never depend on the aliases under test.
+    return getattr(encodings, codec).codec.encode(text)[0]
+
+
+def _encoded_word(raw: bytes, label: str) -> bytes:
+    return b"=?" + label.encode() + b"?B?" + base64.b64encode(raw) + b"?="
+
+
+def _single_part(subject: bytes, label: str, body: bytes) -> bytes:
+    return (
+        b"From: sender@example.test\r\n"
+        b"Subject: " + subject + b"\r\n"
+        b"Content-Type: text/plain; charset=" + label.encode() + b"\r\n"
+        b"Content-Transfer-Encoding: base64\r\n"
+        b"\r\n" + base64.b64encode(body)
+    )
+
+
+def test_gb2312_label_decodes_gbk_characters_in_body_and_headers(rfc_email_client):
+    # Mailers routinely label GBK text as gb2312; strict gb2312 decoding garbles it.
+    subject = "报销单 镕"
+    body = "朱镕基同志啰嗦了一下 报销单已提交"
+    raw_email = (
+        b"From: " + _encoded_word(_strict("李四", "gbk"), "gb2312") + b" <lisi@example.test>\r\n"
+        b"To: recipient@example.test\r\n"
+        b"Subject: " + _encoded_word(_strict(subject, "gbk"), "gb2312") + b"\r\n"
+        b"Content-Type: text/plain; charset=gb2312\r\n"
+        b"Content-Transfer-Encoding: base64\r\n"
+        b"\r\n" + base64.b64encode(_strict(body, "gbk"))
+    )
+
+    parsed = rfc_email_client._parse_email_data(raw_email)
+    metadata = rfc_email_client._parse_headers("1", raw_email.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n")
+
+    assert parsed["subject"] == subject
+    assert parsed["from"] == "李四 <lisi@example.test>"
+    assert parsed["body"] == body
+    assert metadata is not None
+    assert metadata["subject"] == subject
+
+
+def test_gbk_body_falls_back_to_gb18030_for_four_byte_characters(rfc_email_client):
+    body = "扩展A区 㐀"
+    raw_email = _single_part(b"GB18030", "GBK", body.encode("gb18030"))
+
+    assert rfc_email_client._parse_email_data(raw_email)["body"] == body
+
+
+def test_big5_body_falls_back_to_hkscs_characters(rfc_email_client):
+    body = "佢哋講嘅嘢"
+    raw_email = _single_part(b"HKSCS", "big5", body.encode("big5hkscs"))
+
+    assert rfc_email_client._parse_email_data(raw_email)["body"] == body
+
+
+def test_big5_text_that_strict_big5_decodes_is_unchanged(rfc_email_client):
+    # Big5-HKSCS maps C6A1-C7FC differently from Python's big5 and rejects six of
+    # these hiragana, so the superset must only be a fallback.
+    body = "にはぱびぺほ カタカナ ЁЖ"
+    subject = "にほ"
+    raw_email = _single_part(_encoded_word(_strict(subject, "big5"), "big5"), "big5", _strict(body, "big5"))
+
+    parsed = rfc_email_client._parse_email_data(raw_email)
+
+    assert parsed["body"] == body
+    assert parsed["subject"] == subject
+
+
+@pytest.mark.parametrize(
+    "label",
+    [*charsets._WHATWG_GB2312_LABELS, "GB_2312-80", "csGB2312", "EUC-CN", "eucgb2312_cn", "GB2312-1980"],
+)
+def test_gb2312_labels_resolve_to_gb18030(label):
+    assert codecs.lookup(label).name == "gb18030"
+
+
+@pytest.mark.parametrize(
+    ("label", "codec"),
+    [
+        ("gbk", "gbk"),
+        ("cp936", "gbk"),
+        ("x-gbk", "gbk"),
+        ("big5", "big5"),
+        ("cn-big5", "big5"),
+        ("x-x-big5", "big5"),
+        ("big5-hkscs", "big5hkscs"),
+        ("cp950", "cp950"),
+        ("utf-8", "utf-8"),
+        ("shift_jis", "shift_jis"),
+    ],
+)
+def test_other_labels_keep_their_strict_codec(label, codec):
+    assert codecs.lookup(label).name == codec
+
+
+def test_gb18030_decodes_every_gb2312_sequence_like_strict_gb2312_except_whatwg_points():
+    strict = encodings.gb2312.codec
+    differences = {}
+    for lead in range(0xA1, 0xFF):
+        for trail in range(0xA1, 0xFF):
+            sequence = bytes((lead, trail))
+            try:
+                narrow = strict.decode(sequence)[0]
+            except UnicodeDecodeError:
+                continue
+            wide = sequence.decode("gb18030")
+            if wide != narrow:
+                differences[sequence] = (narrow, wide)
+
+    assert differences == {b"\xa1\xa4": ("\u30fb", "\u00b7"), b"\xa1\xaa": ("\u2015", "\u2014")}
+
+
+@pytest.mark.parametrize(
+    ("payload", "label", "expected"),
+    [
+        (b"plain", "x-no-such-codec", "plain"),
+        (b"\xff", "x-no-such-codec", "\ufffd"),
+        (_strict("镕", "gbk"), "gbk", "镕"),
+        ("㐀".encode("gb18030"), "gbk", "㐀"),
+        ("嘅".encode("big5hkscs"), "big5", "嘅"),
+        (b"\x80\xff", "big5", "\ufffd\ufffd"),
+        (b"ok \xff", "utf-8", "ok \ufffd"),
+        (b"plain", "undefined", "plain"),
+        (_strict("镕", "gbk"), "cp936", "镕"),
+    ],
+)
+def test_decode_text_tries_declared_codec_then_superset_then_utf8_replacement(payload, label, expected):
+    assert charsets.decode_text(payload, label) == expected
+
+
+def test_aliases_apply_even_after_an_earlier_strict_lookup():
+    script = (
+        "import codecs\n"
+        "codecs.lookup('gb2312'); codecs.lookup('chinese')\n"
+        "from mcp_email_server.emails import charsets\n"
+        "charsets.install_gb2312_superset_aliases()\n"
+        "charsets.install_gb2312_superset_aliases()\n"
+        "print(codecs.lookup('gb2312').name, codecs.lookup('chinese').name, b'\\xe9F'.decode('gb2312') == '\\u9555')\n"
+    )
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and literal script
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True, timeout=60
+    )
+
+    assert result.stdout.split() == ["gb18030", "gb18030", "True"]
 
 
 def test_unknown_multipart_charset_does_not_hide_valid_parts(rfc_email_client):
@@ -177,8 +333,8 @@ def test_imap_dates_use_fixed_english_month_names():
     expected_months = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
 
     for month, expected in enumerate(expected_months, start=1):
-        value = datetime(2026, month, 1, tzinfo=UTC)
-        assert EmailClient._build_search_criteria(since=value) == ["SINCE", f"01-{expected}-2026"]
+        value = datetime(2026, month, 15, tzinfo=UTC)
+        assert EmailClient._build_search_criteria(since=value) == ["SINCE", f"14-{expected}-2026"]
 
 
 def test_list_response_framing_ignores_completion_and_reassembles_literal():
@@ -244,6 +400,28 @@ def _recording_imap(timeout: float = 1.0, *, fail_write_at: int | None = None):
     imap.protocol = protocol
     imap.timeout = timeout
     return imap, protocol, transport
+
+
+async def _wait_for_transport_writes(transport: _RecordingTransport, count: int = 1) -> None:
+    async with asyncio.timeout(1.0):
+        while len(transport.writes) < count:
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_uid_search_treats_icloud_completion_only_response_as_empty():
+    imap, protocol, transport = _recording_imap()
+
+    search_task = asyncio.create_task(_uid_search(imap, ["ALL"]))
+    await _wait_for_transport_writes(transport)
+
+    tag = transport.writes[0].split(maxsplit=1)[0]
+    protocol.data_received(tag + b" OK SEARCH completed (took 2 ms)\r\n")
+    response = await search_task
+
+    assert response.result == "OK"
+    assert response.lines == [b"SEARCH completed (took 2 ms)"]
+    assert _normalize_search_uids(response.lines) == []
 
 
 @pytest.mark.asyncio
@@ -415,6 +593,24 @@ async def test_legacy_send_rejects_message_smtputf8_before_mail_when_unsupported
 
 
 @pytest.mark.asyncio
+async def test_legacy_smtputf8_send_rejects_before_mail_when_8bitmime_is_missing(rfc_email_client):
+    smtp = _smtp_with_extensions("SMTPUTF8")
+
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        with pytest.raises(SMTPNotSupported, match="8BITMIME"):
+            await rfc_email_client.send_email(
+                ["recipient@example.test"],
+                "Subject",
+                "body",
+                reply_to="回复@example.test",
+            )
+
+    smtp.mail.assert_not_awaited()
+    smtp.sendmail.assert_not_awaited()
+    smtp.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_unicode_reply_to_requires_smtputf8_for_ascii_envelope(rfc_email_client):
     smtp = _smtp_with_extensions("SMTPUTF8", "8BITMIME", "SIZE")
 
@@ -438,6 +634,24 @@ async def test_unicode_reply_to_requires_smtputf8_for_ascii_envelope(rfc_email_c
     assert reply_to is not None
     assert [address.addr_spec for address in reply_to.addresses] == ["回复@example.test"]
     assert [type(defect).__name__ for defect in reply_to.defects] == ["NonASCIILocalPartDefect"]
+
+
+@pytest.mark.asyncio
+async def test_smtputf8_outcome_rejects_before_mail_when_8bitmime_is_missing(rfc_email_client):
+    smtp = _smtp_with_extensions("SMTPUTF8")
+
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        outcome = await rfc_email_client.send_email_with_outcome(
+            ["recipient@example.test"],
+            "Subject",
+            "body",
+            reply_to="回复@example.test",
+        )
+
+    assert [(item.status, item.detail) for item in outcome.outcomes] == [("failed", "smtp-8bitmime-required")]
+    smtp.mail.assert_not_awaited()
+    smtp.rcpt.assert_not_awaited()
+    smtp.data.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -711,7 +925,7 @@ async def test_legacy_sent_copy_does_not_replay_ascii_append_after_timeout(rfc_e
 
 @pytest.mark.asyncio
 async def test_unicode_envelope_recipient_uses_smtputf8_for_mail_rcpt_and_data(rfc_email_client):
-    smtp = _smtp_with_extensions("SMTPUTF8")
+    smtp = _smtp_with_extensions("SMTPUTF8", "8BITMIME")
 
     with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
         outcome = await rfc_email_client.send_email_with_outcome(
@@ -721,7 +935,11 @@ async def test_unicode_envelope_recipient_uses_smtputf8_for_mail_rcpt_and_data(r
         )
 
     assert [(item.status, item.detail) for item in outcome.outcomes] == [("succeeded", None)]
-    smtp.mail.assert_awaited_once_with("test@example.com", options=["SMTPUTF8"], encoding="utf-8")
+    smtp.mail.assert_awaited_once_with(
+        "test@example.com",
+        options=["SMTPUTF8", "BODY=8BITMIME"],
+        encoding="utf-8",
+    )
     smtp.rcpt.assert_awaited_once_with("用户@example.test", encoding="utf-8")
     assert "用户@example.test".encode() in smtp.data.await_args.args[0]
 
