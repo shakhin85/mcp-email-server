@@ -975,18 +975,18 @@ def _forward_provider(
     delivery: DeliveryMutationOutcome | None = None,
     sent_copy: SentCopyMutationOutcome | None = None,
 ) -> MagicMock:
-    provider = MagicMock()
-    provider.fetch_forward_source = AsyncMock(return_value=source if source is not None else _forward_source())
-    provider.forward = AsyncMock(
-        return_value=delivery
+    provider = create_autospec(MutationProvider, instance=True)
+    provider.fetch_forward_source.return_value = source if source is not None else _forward_source()
+    provider.forward.return_value = (
+        delivery
         if delivery is not None
         else DeliveryMutationOutcome(
             (TargetMutationOutcome("recipient@example.test", "succeeded"),),
             object(),
         )
     )
-    provider.save_sent_copy = AsyncMock(
-        return_value=sent_copy if sent_copy is not None else SentCopyMutationOutcome("succeeded", "Sent")
+    provider.save_sent_copy.return_value = (
+        sent_copy if sent_copy is not None else SentCopyMutationOutcome("succeeded", "Sent")
     )
     return provider
 
@@ -1065,7 +1065,7 @@ async def test_forward_subject_is_never_double_prefixed(original_subject: str, e
 @pytest.mark.asyncio
 async def test_forward_source_failure_aborts_before_any_delivery() -> None:
     provider = _forward_provider()
-    provider.fetch_forward_source = AsyncMock(side_effect=MutationProviderError("provider_failure: fetch failed"))
+    provider.fetch_forward_source.side_effect = MutationProviderError("provider_failure: fetch failed")
     services, _, factory, projection = _services(provider=provider)
 
     with pytest.raises(MutationProviderError, match="fetch failed"):
@@ -1080,7 +1080,7 @@ async def test_forward_source_failure_aborts_before_any_delivery() -> None:
 @pytest.mark.asyncio
 async def test_forward_source_not_found_aborts_before_any_delivery() -> None:
     provider = _forward_provider()
-    provider.fetch_forward_source = AsyncMock(side_effect=ValueError("Email 42 not found in INBOX"))
+    provider.fetch_forward_source.side_effect = ValueError("Email 42 not found in INBOX")
     services, _, _, _ = _services(provider=provider)
 
     with pytest.raises(ValueError, match="not found"):
@@ -1097,7 +1097,7 @@ async def test_forward_source_timeout_raises_instead_of_producing_an_outcome(mon
         replace(APPLICATION_LIMITS, provider_timeout_seconds=0.001),
     )
     provider = _forward_provider()
-    provider.fetch_forward_source = AsyncMock(side_effect=_hang_provider)
+    provider.fetch_forward_source.side_effect = _hang_provider
     services, _, _, projection = _services(provider=provider)
 
     with pytest.raises(MutationProviderError, match="forward source retrieval timed out"):
@@ -1393,7 +1393,7 @@ async def test_forward_delivery_timeout_is_unknown_and_never_replayed(monkeypatc
         replace(APPLICATION_LIMITS, provider_timeout_seconds=0.001),
     )
     provider = _forward_provider()
-    provider.forward = AsyncMock(side_effect=_hang_provider)
+    provider.forward.side_effect = _hang_provider
     services, _, _, projection = _services(provider=provider)
 
     result = await services.forward.execute(
@@ -1452,7 +1452,7 @@ async def test_forward_carries_the_delivered_message_id() -> None:
 @pytest.mark.asyncio
 async def test_forward_sent_copy_failure_does_not_downgrade_delivery() -> None:
     provider = _forward_provider()
-    provider.save_sent_copy = AsyncMock(side_effect=MutationProviderError("provider_failure: append failed"))
+    provider.save_sent_copy.side_effect = MutationProviderError("provider_failure: append failed")
     services, _, _, projection = _services(provider=provider)
 
     result = await services.forward.execute(_forward_command())
@@ -1472,7 +1472,7 @@ async def test_forward_sent_copy_timeout_preserves_delivery_and_is_unknown(monke
         replace(APPLICATION_LIMITS, provider_timeout_seconds=0.001),
     )
     provider = _forward_provider()
-    provider.save_sent_copy = AsyncMock(side_effect=_hang_provider)
+    provider.save_sent_copy.side_effect = _hang_provider
     services, _, _, _ = _services(provider=provider)
 
     result = await services.forward.execute(_forward_command())

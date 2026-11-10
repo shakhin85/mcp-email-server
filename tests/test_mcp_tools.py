@@ -3,7 +3,7 @@ import re
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, TextContent
@@ -1028,14 +1028,15 @@ async def test_send_tool_reports_safe_transport_rejection(detail: str) -> None:
 
 @pytest.mark.asyncio
 async def test_forward_tool_dispatches_source_selection_and_reports_success() -> None:
-    command_handler = AsyncMock(
+    command_handler = create_autospec(
+        app_module.forward_email_command,
         return_value=SendMutationOutcome(
             (
                 TargetMutationOutcome("recipient@example.test", "succeeded"),
                 TargetMutationOutcome("cc@example.test", "succeeded"),
             ),
             SentCopyMutationOutcome("succeeded", "Sent", "append"),
-        )
+        ),
     )
     with patch("mcp_email_server.app.forward_email_command", command_handler):
         result = await forward_email(
@@ -1064,11 +1065,12 @@ async def test_forward_tool_dispatches_source_selection_and_reports_success() ->
 
 @pytest.mark.asyncio
 async def test_forward_tool_defaults_to_inbox_with_no_note_and_attachments_retained() -> None:
-    command_handler = AsyncMock(
+    command_handler = create_autospec(
+        app_module.forward_email_command,
         return_value=SendMutationOutcome(
             (TargetMutationOutcome("recipient@example.test", "succeeded"),),
             SentCopyMutationOutcome("skipped"),
-        )
+        ),
     )
     with patch("mcp_email_server.app.forward_email_command", command_handler):
         await forward_email("test_account", "12345", ["recipient@example.test"])
@@ -1081,7 +1083,8 @@ async def test_forward_tool_defaults_to_inbox_with_no_note_and_attachments_retai
 
 @pytest.mark.asyncio
 async def test_forward_tool_reports_partial_delivery_and_sent_copy_separately() -> None:
-    command_handler = AsyncMock(
+    command_handler = create_autospec(
+        app_module.forward_email_command,
         return_value=SendMutationOutcome(
             (
                 TargetMutationOutcome("first@example.test", "succeeded"),
@@ -1089,7 +1092,7 @@ async def test_forward_tool_reports_partial_delivery_and_sent_copy_separately() 
                 TargetMutationOutcome("third@example.test", "unknown", "provider-timeout"),
             ),
             SentCopyMutationOutcome("failed", "Sent", "append"),
-        )
+        ),
     )
     with patch("mcp_email_server.app.forward_email_command", command_handler):
         result = await forward_email(
@@ -1107,7 +1110,9 @@ async def test_forward_tool_reports_partial_delivery_and_sent_copy_separately() 
 
 @pytest.mark.asyncio
 async def test_forward_tool_maps_application_recipient_denial() -> None:
-    command_handler = AsyncMock(side_effect=RecipientPolicyDeniedError("recipient denied"))
+    command_handler = create_autospec(
+        app_module.forward_email_command, side_effect=RecipientPolicyDeniedError("recipient denied")
+    )
     with patch("mcp_email_server.app.forward_email_command", command_handler):
         with pytest.raises(ValueError, match="Recipient\\(s\\) not in allowlist"):
             await forward_email("test_account", "12345", ["mallory@evil.test"])
@@ -1115,11 +1120,12 @@ async def test_forward_tool_maps_application_recipient_denial() -> None:
 
 @pytest.mark.asyncio
 async def test_forward_tool_does_not_expose_unrecognized_provider_detail() -> None:
-    command_handler = AsyncMock(
+    command_handler = create_autospec(
+        app_module.forward_email_command,
         return_value=SendMutationOutcome(
             (TargetMutationOutcome("recipient@example.test", "failed", "private provider response"),),
             SentCopyMutationOutcome("skipped"),
-        )
+        ),
     )
     with patch("mcp_email_server.app.forward_email_command", command_handler):
         result = await forward_email("test_account", "12345", ["recipient@example.test"])
@@ -1259,12 +1265,13 @@ async def test_send_tool_does_not_invent_a_message_id_for_an_ambiguous_delivery(
 
 @pytest.mark.asyncio
 async def test_forward_tool_names_the_delivered_message_id() -> None:
-    command_handler = AsyncMock(
+    command_handler = create_autospec(
+        app_module.forward_email_command,
         return_value=SendMutationOutcome(
             (TargetMutationOutcome("recipient@example.test", "succeeded"),),
             SentCopyMutationOutcome("succeeded", "Sent"),
             message_id="<forwarded.1@example.test>",
-        )
+        ),
     )
     with patch("mcp_email_server.app.forward_email_command", command_handler):
         result = await forward_email("test_account", "12345", ["recipient@example.test"])
@@ -1274,11 +1281,12 @@ async def test_forward_tool_names_the_delivered_message_id() -> None:
 
 @pytest.mark.asyncio
 async def test_forward_tool_does_not_invent_a_message_id_for_an_ambiguous_delivery() -> None:
-    command_handler = AsyncMock(
+    command_handler = create_autospec(
+        app_module.forward_email_command,
         return_value=SendMutationOutcome(
             (TargetMutationOutcome("recipient@example.test", "unknown", "provider-timeout"),),
             SentCopyMutationOutcome("skipped"),
-        )
+        ),
     )
     with patch("mcp_email_server.app.forward_email_command", command_handler):
         result = await forward_email("test_account", "12345", ["recipient@example.test"])

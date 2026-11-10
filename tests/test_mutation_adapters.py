@@ -6,13 +6,14 @@ from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email.policy import SMTP as SMTP_POLICY
 from email.policy import SMTPUTF8 as SMTPUTF8_POLICY
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, create_autospec
 
 import pytest
 
 from mcp_email_server.adapters.mutations import ClassicMutationProvider
 from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
+    DeliveryMutationOutcome,
     ForwardCommand,
     ForwardSource,
     ForwardSourcePart,
@@ -25,7 +26,7 @@ from mcp_email_server.application.mutations import (
     SetEmailTagsCommand,
 )
 from mcp_email_server.config import EmailSettings
-from mcp_email_server.emails.classic import ResolvedReply
+from mcp_email_server.emails.classic import ClassicEmailHandler, EmailClient, ResolvedReply
 
 
 def _set_flags_provider(error: BaseException) -> ClassicMutationProvider:
@@ -257,6 +258,16 @@ async def test_mutation_adapter_threads_and_quotes_reply(email_settings: EmailSe
     assert handler.incoming_client.compose_message.call_args.kwargs["thread_index"] == "AdX0parentIndex=="
 
 
+def _classic_handler(email_settings: EmailSettings | None = None) -> MagicMock:
+    """Signature-checked handler; instance attributes are set because autospec sees only class attributes."""
+    handler = create_autospec(ClassicEmailHandler, instance=True)
+    if email_settings is not None:
+        handler.email_settings = email_settings
+    handler.incoming_client = create_autospec(EmailClient, instance=True)
+    handler.outgoing_client = create_autospec(EmailClient, instance=True)
+    return handler
+
+
 def _forward_part(payload: bytes = b"report bytes", filename: str = "report.pdf") -> Message:
     part = MIMEBase("application", "pdf", name=filename)
     part.set_payload(payload)
@@ -295,8 +306,8 @@ def _forward_command(**changes: object) -> ForwardCommand:
 @pytest.mark.asyncio
 async def test_mutation_adapter_threads_allowlist_and_attachment_choice_into_forward_source() -> None:
     part = _forward_part()
-    handler = MagicMock()
-    handler.incoming_client.fetch_forward_source = AsyncMock(return_value=_forward_source_payload([part]))
+    handler = _classic_handler()
+    handler.incoming_client.fetch_forward_source.return_value = _forward_source_payload([part])
     account = MutationAccountSnapshot("primary", "managed", ("*@allowed.test",), (), False, can_send=True)
 
     source = await ClassicMutationProvider(handler).fetch_forward_source(
@@ -322,8 +333,8 @@ async def test_mutation_adapter_reports_serialized_forward_part_size() -> None:
     """The bounded size is what SMTP carries, not the decoded payload length."""
     payload = b"x" * 4096
     part = _forward_part(payload)
-    handler = MagicMock()
-    handler.incoming_client.fetch_forward_source = AsyncMock(return_value=_forward_source_payload([part]))
+    handler = _classic_handler()
+    handler.incoming_client.fetch_forward_source.return_value = _forward_source_payload([part])
 
     source = await ClassicMutationProvider(handler).fetch_forward_source(_forward_command(), _account())
 
@@ -335,8 +346,8 @@ async def test_mutation_adapter_reports_serialized_forward_part_size() -> None:
 async def test_mutation_adapter_counts_smtp_crlf_expansion_in_forward_part_size() -> None:
     part = MIMEText("x\n" * 1000, "plain", "us-ascii")
     part.add_header("Content-Disposition", "attachment", filename="lines.txt")
-    handler = MagicMock()
-    handler.incoming_client.fetch_forward_source = AsyncMock(return_value=_forward_source_payload([part]))
+    handler = _classic_handler()
+    handler.incoming_client.fetch_forward_source.return_value = _forward_source_payload([part])
 
     source = await ClassicMutationProvider(handler).fetch_forward_source(_forward_command(), _account())
 
@@ -354,8 +365,8 @@ async def test_mutation_adapter_counts_smtp_crlf_expansion_in_forward_part_size(
     ],
 )
 async def test_mutation_adapter_preserves_forward_source_sentinel_exceptions(error: BaseException) -> None:
-    handler = MagicMock()
-    handler.incoming_client.fetch_forward_source = AsyncMock(side_effect=error)
+    handler = _classic_handler()
+    handler.incoming_client.fetch_forward_source.side_effect = error
 
     with pytest.raises(type(error)) as caught:
         await ClassicMutationProvider(handler).fetch_forward_source(_forward_command(), _account())
@@ -366,8 +377,8 @@ async def test_mutation_adapter_preserves_forward_source_sentinel_exceptions(err
 @pytest.mark.asyncio
 async def test_mutation_adapter_sanitizes_unexpected_forward_source_failure() -> None:
     provider_detail = "IMAP FETCH failed: server-controlled secret detail"
-    handler = MagicMock()
-    handler.incoming_client.fetch_forward_source = AsyncMock(side_effect=RuntimeError(provider_detail))
+    handler = _classic_handler()
+    handler.incoming_client.fetch_forward_source.side_effect = RuntimeError(provider_detail)
 
     with pytest.raises(
         MutationProviderError,
@@ -386,8 +397,8 @@ async def test_mutation_adapter_sanitizes_unserializable_forward_part() -> None:
     broken.get_content_type.return_value = "application/pdf"
     broken.get_filename.return_value = "report.pdf"
     broken.as_bytes.side_effect = RuntimeError("flatten failed")
-    handler = MagicMock()
-    handler.incoming_client.fetch_forward_source = AsyncMock(return_value=_forward_source_payload([broken]))
+    handler = _classic_handler()
+    handler.incoming_client.fetch_forward_source.return_value = _forward_source_payload([broken])
 
     with pytest.raises(MutationProviderError, match=r"^provider_failure: mutation provider request failed$"):
         await ClassicMutationProvider(handler).fetch_forward_source(_forward_command(), _account())
@@ -395,7 +406,7 @@ async def test_mutation_adapter_sanitizes_unserializable_forward_part() -> None:
 
 @pytest.mark.asyncio
 async def test_mutation_adapter_rejects_forward_without_smtp() -> None:
-    handler = MagicMock()
+    handler = _classic_handler()
     handler.outgoing_client = None
 
     with pytest.raises(MutationProviderError, match="capability_unavailable: SMTP is not configured"):
@@ -415,11 +426,10 @@ async def test_mutation_adapter_submits_forward_body_verbatim_with_reattached_pa
         "---------- Forwarded message ----------\n\noriginal body",
         (ForwardSourcePart(_forward_wire_size(part), part),),
     )
-    outcome = MagicMock()
-    handler = MagicMock()
-    handler.email_settings = email_settings
-    handler.resolve_reply = AsyncMock(side_effect=lambda body, *_: ResolvedReply(body, None))
-    handler.outgoing_client.send_email_with_outcome = AsyncMock(return_value=outcome)
+    outcome = create_autospec(DeliveryMutationOutcome, instance=True)
+    handler = _classic_handler(email_settings)
+    handler.resolve_reply.side_effect = lambda body, *_: ResolvedReply(body, None)
+    handler.outgoing_client.send_email_with_outcome.return_value = outcome
     command = _forward_command(cc=("cc@example.test",))
 
     assert await ClassicMutationProvider(handler).forward(command, source, _account()) is outcome
@@ -443,7 +453,7 @@ async def test_mutation_adapter_submits_forward_body_verbatim_with_reattached_pa
 
 @pytest.mark.asyncio
 async def test_mutation_adapter_rejects_invalid_forward_part_evidence() -> None:
-    handler = MagicMock()
+    handler = _classic_handler()
     source = ForwardSource(
         "Quarterly report",
         "author@example.test",
@@ -457,10 +467,12 @@ async def test_mutation_adapter_rejects_invalid_forward_part_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mutation_adapter_sanitizes_unexpected_forward_delivery_failure() -> None:
+async def test_mutation_adapter_sanitizes_unexpected_forward_delivery_failure(
+    email_settings: EmailSettings,
+) -> None:
     provider_detail = "SMTP 550 server-controlled secret detail"
-    handler = MagicMock()
-    handler.outgoing_client.send_email_with_outcome = AsyncMock(side_effect=RuntimeError(provider_detail))
+    handler = _classic_handler(email_settings)
+    handler.outgoing_client.send_email_with_outcome.side_effect = RuntimeError(provider_detail)
 
     with pytest.raises(
         MutationProviderError,
