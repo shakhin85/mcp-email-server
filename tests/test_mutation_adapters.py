@@ -13,6 +13,7 @@ import pytest
 from mcp_email_server.adapters.mutations import ClassicMutationProvider
 from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
+    BatchMutationOutcome,
     DeliveryMutationOutcome,
     ForwardCommand,
     ForwardSource,
@@ -29,9 +30,19 @@ from mcp_email_server.config import EmailSettings
 from mcp_email_server.emails.classic import ClassicEmailHandler, EmailClient, ResolvedReply
 
 
+def _classic_handler(email_settings: EmailSettings | None = None) -> MagicMock:
+    """Signature-checked handler; instance attributes are set because autospec sees only class attributes."""
+    handler = create_autospec(ClassicEmailHandler, instance=True)
+    if email_settings is not None:
+        handler.email_settings = email_settings
+    handler.incoming_client = create_autospec(EmailClient, instance=True)
+    handler.outgoing_client = create_autospec(EmailClient, instance=True)
+    return handler
+
+
 def _set_flags_provider(error: BaseException) -> ClassicMutationProvider:
-    handler = MagicMock()
-    handler.incoming_client.set_email_flags_with_outcome = AsyncMock(side_effect=error)
+    handler = _classic_handler()
+    handler.incoming_client.set_email_flags_with_outcome.side_effect = error
     return ClassicMutationProvider(handler)
 
 
@@ -74,9 +85,9 @@ async def test_mutation_adapter_sanitizes_unexpected_provider_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_mutation_adapter_forwards_generic_flag_contract_and_policy() -> None:
-    outcome = MagicMock()
-    handler = MagicMock()
-    handler.incoming_client.set_email_flags_with_outcome = AsyncMock(return_value=outcome)
+    outcome = create_autospec(BatchMutationOutcome, instance=True)
+    handler = _classic_handler()
+    handler.incoming_client.set_email_flags_with_outcome.return_value = outcome
     provider = ClassicMutationProvider(handler)
     account = MutationAccountSnapshot("primary", "managed", ("*@allowed.test",), (), True, can_send=True)
     command = SetEmailFlagsCommand("primary", ("1", "2"), "remove", (r"\Seen", r"\Flagged"), "Archive")
@@ -94,9 +105,9 @@ async def test_mutation_adapter_forwards_generic_flag_contract_and_policy() -> N
 
 @pytest.mark.asyncio
 async def test_mutation_adapter_forwards_generic_tag_contract_and_policy() -> None:
-    outcome = MagicMock()
-    handler = MagicMock()
-    handler.incoming_client.set_email_tags_with_outcome = AsyncMock(return_value=outcome)
+    outcome = create_autospec(BatchMutationOutcome, instance=True)
+    handler = _classic_handler()
+    handler.incoming_client.set_email_tags_with_outcome.return_value = outcome
     provider = ClassicMutationProvider(handler)
     account = MutationAccountSnapshot("primary", "managed", ("*@allowed.test",), (), True, can_send=True)
     command = SetEmailTagsCommand("primary", ("1", "2"), "remove", ("$label4",), "Archive")
@@ -256,16 +267,6 @@ async def test_mutation_adapter_threads_and_quotes_reply(email_settings: EmailSe
     handler.resolve_reply.assert_awaited_once_with("Body", False, "<parent@example.test>", False)
     assert handler.incoming_client.compose_message.call_args.args[2] == "Body\n\nquoted parent"
     assert handler.incoming_client.compose_message.call_args.kwargs["thread_index"] == "AdX0parentIndex=="
-
-
-def _classic_handler(email_settings: EmailSettings | None = None) -> MagicMock:
-    """Signature-checked handler; instance attributes are set because autospec sees only class attributes."""
-    handler = create_autospec(ClassicEmailHandler, instance=True)
-    if email_settings is not None:
-        handler.email_settings = email_settings
-    handler.incoming_client = create_autospec(EmailClient, instance=True)
-    handler.outgoing_client = create_autospec(EmailClient, instance=True)
-    return handler
 
 
 def _forward_part(payload: bytes = b"report bytes", filename: str = "report.pdf") -> Message:
